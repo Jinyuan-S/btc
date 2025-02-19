@@ -273,7 +273,6 @@ def hasher_process(qunpack_hash_l, qhash_out):
 # this process takes blocks from the queue and analyses their inputs / 这个过程从队列中获取块并分析它们的输入
 # maintains some status information and synchronizes the database flushes / 维护一些状态信息并同步数据库刷新
 def dist_in_process(qunpack_in_l, qin_child_l):
-
     for h in itr.count(0):
         # get next block / 下一个块
         trans = qunpack_in_l[h % 3].get()
@@ -524,22 +523,32 @@ def writer_process(qchild_write_l, qsync_write):
 
 # the reader talks to the output and input analyser, sending them the same block / 阅读器与输出和输入分析器对话，向它们发送相同的块
 # we want these queues to be a bit longer so to avoid delays when a new .dat file is opened / 我们希望这些队列稍微长一点，以避免在打开新的.dat文件时出现延迟
-qread_unpack_l = [ Queue(12) for i in range(3) ]
-qread_sync = Queue(36)
+
+# Increase the number of parallel processes for unpacking and analysis
+NUM_UNPACKERS = 4  # Number of processes dedicated to unpacking raw blockchain data from .dat files
+NUM_ANALYZERS = 12  # Number of processes dedicated to analyzing transaction inputs/outputs
+
+# Increase queue sizes for better buffering
+QUEUE_SIZE_STANDARD = 24  # Standard queue size for most inter-process communication
+QUEUE_SIZE_LARGE = 48    # Larger queue size for communication between reader and unpackers
+QUEUE_SIZE_XLARGE = 72   # Extra large queue size for database writer operations
+
+qread_unpack_l = [ Queue(QUEUE_SIZE_LARGE) for i in range(NUM_UNPACKERS) ]
+qread_sync = Queue(QUEUE_SIZE_XLARGE)
 # pre-processing steps / 预处理步骤
-qunpack_hash_l = [ Queue(6) for i in range(3) ]
-qunpack_in_l = [ Queue(6) for i in range(3) ]
-qhash_out = Queue(6)
+qunpack_hash_l = [ Queue(QUEUE_SIZE_STANDARD) for i in range(NUM_UNPACKERS) ]
+qunpack_in_l = [ Queue(QUEUE_SIZE_STANDARD) for i in range(NUM_UNPACKERS) ]
+qhash_out = Queue(QUEUE_SIZE_STANDARD)
 # the output analyser updates the input analyser and its children when he is done / 输出分析器完成后更新输入分析器及其子分析器
-qout_child_l = [ Queue(6*2) for i in range(8) ]
+qout_child_l = [ Queue(QUEUE_SIZE_STANDARD * 2) for i in range(NUM_ANALYZERS) ]
 # input analyser talks to his children / 输入分析器和他的孩子说话
-qin_child_l = [ Queue(6) for i in range(8) ]
-qchild_sync_l = [ Queue(6) for i in range(8) ]
+qin_child_l = [ Queue(QUEUE_SIZE_STANDARD) for i in range(NUM_ANALYZERS) ]
+qchild_sync_l = [ Queue(QUEUE_SIZE_STANDARD) for i in range(NUM_ANALYZERS) ]
 # the children write directly to the writer / 孩子们直接给作者写信
 # we want these queues to be a bit longer so that we can process during database snapshots / 我们希望这些队列稍微长一点，以便我们可以在数据库快照期间进行处理
-qchild_write_l = [ Queue(36) for i in range(8) ]
+qchild_write_l = [ Queue(QUEUE_SIZE_XLARGE) for i in range(NUM_ANALYZERS) ]
 # the synchronizer initiates the flush / 同步器启动刷新
-qsync_write = Queue(36*2)
+qsync_write = Queue(QUEUE_SIZE_XLARGE * 2)
 
 # current file, block, and height - shared for status update / 当前文件、块和高度-共享用于状态更新
 f = Value('i', 0)
@@ -550,34 +559,60 @@ utxolen = Value('i', 0)
 
 # start the four helper processes / 启动四个辅助进程
 p_read = Process(target=reader_process, args=(qread_unpack_l, qread_sync, f, b, MAX_FILE))
-p_unpack_l = [ Process(target=unpacker_process, args=(qread_unpack_l[i], qunpack_in_l[i], qunpack_hash_l[i])) for i in range(3) ]
+p_unpack_l = [ Process(target=unpacker_process, args=(qread_unpack_l[i], qunpack_in_l[i], qunpack_hash_l[i])) for i in range(NUM_UNPACKERS) ]
 p_hash = Process(target=hasher_process, args=(qunpack_hash_l, qhash_out))
 p_dist_in = Process(target=dist_in_process, args=(qunpack_in_l, qin_child_l))
 p_dist_out = Process(target=dist_out_process, args=(qhash_out, qout_child_l))
 p_analyse_child_l = [ Process(target=analysis_process_child, args=(qin_child_l[i], qout_child_l[i], qchild_sync_l[i], qchild_write_l[i]))
-                                for i in range(8) ]
+                                for i in range(NUM_ANALYZERS) ]
 p_sync = Process(target=sync_process, args=(qchild_sync_l, qread_sync, qsync_write, h, utxolen))
 p_write = Process(target=writer_process, args=(qchild_write_l, qsync_write))
 
 T = datetime.now()
 
 if __name__ == "__main__":
-
+    # Initialize MongoDB with write concern and batch size optimizations
+    client = db.MongoClient(w=1, 
+                          journal=False, 
+                          maxPoolSize=200,
+                          maxIdleTimeMS=30000)
+    
+    # Start processes
     p_read.start()
+    p_unpack_l = [Process(target=unpacker_process, 
+                         args=(qread_unpack_l[i], qunpack_in_l[i], qunpack_hash_l[i])) 
+                  for i in range(NUM_UNPACKERS)]
+    
     for process in p_unpack_l:
         process.start()
+        
     p_hash.start()
     p_dist_in.start()
     p_dist_out.start()
+    
+    p_analyse_child_l = [Process(target=analysis_process_child, 
+                                args=(qin_child_l[i], qout_child_l[i], 
+                                     qchild_sync_l[i], qchild_write_l[i]))
+                        for i in range(NUM_ANALYZERS)]
+    
     for process in p_analyse_child_l:
         process.start()
+        
     p_sync.start()
     p_write.start()
 
+    # Add process monitoring
     while p_write.is_alive():
-        # status update on screen (every second) / 屏幕上的状态更新（每秒）
         time.sleep(1)
-
         delta = datetime.now() - T
-        print('running time: %02d:%02d:%02d' % (delta.seconds / (60*60) + delta.days * 24, (delta.seconds / 60) % 60, delta.seconds % 60) + '   input file: ' + str(f.value) + '/' + str(MAX_FILE) + '   height: ' + str(h.value)
-              + '/' + str(b.value) + '   utxo size: ' + str(utxolen.value) + '\n', end='', flush=True)
+        print(f'running time: {delta.seconds // 3600 + delta.days * 24:02d}:'
+              f'{(delta.seconds // 60) % 60:02d}:{delta.seconds % 60:02d}'
+              f'   input file: {f.value}/{MAX_FILE}'
+              f'   height: {h.value}/{b.value}'
+              f'   utxo size: {utxolen.value}\n', 
+              end='', flush=True)
+
+    # Clean up processes
+    for process in p_unpack_l + p_analyse_child_l + [p_read, p_hash, p_dist_in, 
+                                                    p_dist_out, p_sync, p_write]:
+        process.join()
