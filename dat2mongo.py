@@ -12,8 +12,10 @@ from struct import unpack
 
 # maximum file number (ignore last file because of possible orphans) / 最大文件数（忽略最后一个文件，因为可能有孤儿）
 MAX_FILE = 1234
-#MAX_FILE = 1
 file_path = 'E:/Prof Marco FYP Blockchain/data/blocks/blk%05d.dat'
+NUM_UNPACKERS = 3  # 4 cores
+NUM_ANALYZERS = 8  # 12 cores (plus reader, hasher, etc.)
+
 
 # flags for address types / 地址类型标志
 ADDR_UNKNOWN        = int(-1)
@@ -276,7 +278,7 @@ def hasher_process(qunpack_hash_l, qhash_out):
 def dist_in_process(qunpack_in_l, qin_child_l):
     for h in itr.count(0):
         # get next block / 下一个块
-        trans = qunpack_in_l[h % 3].get()
+        trans = qunpack_in_l[h % NUM_UNPACKERS].get()
         if not trans:
             # we are done here / 我们做完了
             return
@@ -290,10 +292,10 @@ def dist_in_process(qunpack_in_l, qin_child_l):
                     # calculate utxo hash / 计算utxo哈希值
                     utxohash = calcutxohash(tin.transaction_index, tin.hex[:32])
                     # put it into the right batch / 把它放到合适的批次里
-                    tins_l[utxohash % 8].append( (tin, utxohash) )
+                    tins_l[utxohash % NUM_ANALYZERS].append( (tin, utxohash) )
        
         # send transaction inputs to the children / 向子节点发送事务输入
-        for idx in range(8):
+        for idx in range(NUM_ANALYZERS):
             qin_child_l[idx].put(tins_l[idx])
             
             
@@ -524,30 +526,20 @@ def writer_process(qchild_write_l, qsync_write):
 
 # the reader talks to the output and input analyser, sending them the same block / 阅读器与输出和输入分析器对话，向它们发送相同的块
 # we want these queues to be a bit longer so to avoid delays when a new .dat file is opened / 我们希望这些队列稍微长一点，以避免在打开新的.dat文件时出现延迟
-
-# Increase the number of parallel processes for unpacking and analysis
-NUM_UNPACKERS = 4  # Number of processes dedicated to unpacking raw blockchain data from .dat files
-NUM_ANALYZERS = 12  # Number of processes dedicated to analyzing transaction inputs/outputs
-
-# Increase queue sizes for better buffering
-QUEUE_SIZE_STANDARD = 24  # Standard queue size for most inter-process communication
-QUEUE_SIZE_LARGE = 48    # Larger queue size for communication between reader and unpackers
-QUEUE_SIZE_XLARGE = 72   # Extra large queue size for database writer operations
-
-qread_unpack_l = [ Queue(QUEUE_SIZE_LARGE) for i in range(NUM_UNPACKERS) ]
-qread_sync = Queue(QUEUE_SIZE_XLARGE)
+qread_unpack_l = [ Queue(12) for i in range(NUM_UNPACKERS) ]
+qread_sync = Queue(36)
 # pre-processing steps / 预处理步骤
-qunpack_hash_l = [ Queue(QUEUE_SIZE_STANDARD) for i in range(NUM_UNPACKERS) ]
-qunpack_in_l = [ Queue(QUEUE_SIZE_STANDARD) for i in range(NUM_UNPACKERS) ]
-qhash_out = Queue(QUEUE_SIZE_STANDARD)
+qunpack_hash_l = [ Queue(6) for i in range(NUM_UNPACKERS) ]
+qunpack_in_l = [ Queue(6) for i in range(NUM_UNPACKERS) ]
+qhash_out = Queue(6)
 # the output analyser updates the input analyser and its children when he is done / 输出分析器完成后更新输入分析器及其子分析器
-qout_child_l = [ Queue(QUEUE_SIZE_STANDARD * 2) for i in range(NUM_ANALYZERS) ]
+qout_child_l = [ Queue(6*2) for i in range(NUM_ANALYZERS) ]
 # input analyser talks to his children / 输入分析器和他的孩子说话
-qin_child_l = [ Queue(QUEUE_SIZE_STANDARD) for i in range(NUM_ANALYZERS) ]
-qchild_sync_l = [ Queue(QUEUE_SIZE_STANDARD) for i in range(NUM_ANALYZERS) ]
+qin_child_l = [ Queue(6) for i in range(NUM_ANALYZERS) ]
+qchild_sync_l = [ Queue(6) for i in range(NUM_ANALYZERS) ]
 # the children write directly to the writer / 孩子们直接给作者写信
 # we want these queues to be a bit longer so that we can process during database snapshots / 我们希望这些队列稍微长一点，以便我们可以在数据库快照期间进行处理
-qchild_write_l = [ Queue(QUEUE_SIZE_XLARGE) for i in range(NUM_ANALYZERS) ]
+qchild_write_l = [ Queue(36) for i in range(NUM_ANALYZERS) ]
 # the synchronizer initiates the flush / 同步器启动刷新
 qsync_write = Queue(QUEUE_SIZE_XLARGE * 2)
 
