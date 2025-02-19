@@ -1,5 +1,6 @@
 import pymongo
 import pymysql
+import math
 
 # ========== 配置部分 ==========
 MONGO_URI = "mongodb://localhost:27017"
@@ -10,8 +11,11 @@ SNAP_COLL = "snap"          # btc.snap 集合
 MYSQL_HOST     = "127.0.0.1"
 MYSQL_PORT     = 3306
 MYSQL_USER     = "root"
-MYSQL_PASSWORD = "gsj123"
+MYSQL_PASSWORD = "btcbtc"
 MYSQL_DB       = "btc"   # 你在MySQL中创建的数据库
+
+# 批量提交的大小
+BATCH_SIZE = 2000
 
 # ========== 连接MongoDB ==========
 mongo_client = pymongo.MongoClient(MONGO_URI)
@@ -32,67 +36,116 @@ conn = pymysql.connect(
 cursor = conn.cursor()
 
 # =====================================
-# 1. 将地址数据 (btc.addr) 导入 addresses 表
+# 1. 导入 addresses
 # =====================================
 print(">>> Importing addresses ...")
 
-addr_docs = coll_addr.find({})
-count_addr = 0
+# 获取文档总数（若数量极大，也可以用 estimated_document_count()）
+addr_count_total = coll_addr.count_documents({})
+print(f"Total addresses to process: {addr_count_total}")
 
-for doc in addr_docs:
-    # 从Mongo文档提取字段
-    # 如果Mongo里没有某个字段，就给个默认值
-    keyhash     = str(doc['_id'])         # 或者 doc['_id'].hex() 视情况
+addr_cursor = coll_addr.find({})
+count_addr = 0
+batch_data = []
+
+sql_addr = """
+INSERT INTO addresses
+  (keyhash, addr, type, val, key_seen, ins_count, outs_count, last_height)
+VALUES
+  (%s, %s, %s, %s, %s, %s, %s, %s)
+ON DUPLICATE KEY UPDATE
+  val=VALUES(val),
+  key_seen=VALUES(key_seen),
+  ins_count=VALUES(ins_count),
+  outs_count=VALUES(outs_count),
+  last_height=VALUES(last_height)
+"""
+
+for doc in addr_cursor:
+    # 提取字段
+    keyhash     = str(doc['_id'])
     addr_str    = doc.get('addr', None)
     type_int    = doc.get('type', -1)
     val_satoshi = doc.get('val', 0)
     key_seen    = doc.get('key-seen', 0)
-    ins_count   = doc.get('ins', 0)       # 如果在 dat2mongo.py 中有存储
+    ins_count   = doc.get('ins', 0)
     outs_count  = doc.get('outs', 0)
     last_height = doc.get('height', None)
 
-    # 构造SQL插入
-    sql_addr = """
-    INSERT INTO addresses
-      (keyhash, addr, type, val, key_seen, ins_count, outs_count, last_height)
-    VALUES
-      (%s, %s, %s, %s, %s, %s, %s, %s)
-    ON DUPLICATE KEY UPDATE
-      val=VALUES(val),
-      key_seen=VALUES(key_seen),
-      ins_count=VALUES(ins_count),
-      outs_count=VALUES(outs_count),
-      last_height=VALUES(last_height)
-    """
-    # 上面用 ON DUPLICATE KEY UPDATE 以便“upsert”效果，
-    # 前提是你给 addresses(keyhash) 建了唯一索引(UNIQUE keyhash)。
-
-    cursor.execute(sql_addr, (
+    row = (
         keyhash, addr_str, type_int, val_satoshi,
         key_seen, ins_count, outs_count, last_height
-    ))
+    )
+    batch_data.append(row)
     count_addr += 1
 
-conn.commit()
-print(f"Done addresses: {count_addr} rows inserted/updated.")
+    # 如果达到了批大小，执行一次批量插入
+    if len(batch_data) >= BATCH_SIZE:
+        cursor.executemany(sql_addr, batch_data)
+        conn.commit()
+        batch_data.clear()
+
+        # 打印进度
+        progress = count_addr / addr_count_total * 100 if addr_count_total else 0
+        print(f"Processed {count_addr} / {addr_count_total} ({progress:.2f}%) addresses", flush=True)
+
+# 处理剩余不满一批的数据
+if batch_data:
+    cursor.executemany(sql_addr, batch_data)
+    conn.commit()
+    batch_data.clear()
+
+print(f"Done addresses: {count_addr} rows inserted/updated.\n")
 
 
 # =====================================
-# 2. 导入快照数据 (btc.snap) -> snapshots, snapshot_summary_by_type, snapshot_quantum_by_type
+# 2. 导入快照 snapshots (示例：不做批插，可自己加批量逻辑)
 # =====================================
 print(">>> Importing snapshots ...")
 
-snap_docs = coll_snap.find({})
+snap_count_total = coll_snap.count_documents({})
+print(f"Total snapshots to process: {snap_count_total}")
+
+sql_snap = """
+INSERT INTO snapshots
+  (height, snap_date, tot_val, op_return, unknown, qattack_frac, unknown_frac)
+VALUES
+  (%s, %s, %s, %s, %s, %s, %s)
+ON DUPLICATE KEY UPDATE
+  snap_date=VALUES(snap_date),
+  tot_val=VALUES(tot_val),
+  op_return=VALUES(op_return),
+  unknown=VALUES(unknown),
+  qattack_frac=VALUES(qattack_frac),
+  unknown_frac=VALUES(unknown_frac)
+"""
+
+sql_sum = """
+INSERT INTO snapshot_summary_by_type
+  (snap_height, addr_type, num_pos, tot_val)
+VALUES
+  (%s, %s, %s, %s)
+ON DUPLICATE KEY UPDATE
+  num_pos=VALUES(num_pos),
+  tot_val=VALUES(tot_val)
+"""
+
+sql_q = """
+INSERT INTO snapshot_quantum_by_type
+  (snap_height, addr_type, num_pos, tot_val)
+VALUES
+  (%s, %s, %s, %s)
+ON DUPLICATE KEY UPDATE
+  num_pos=VALUES(num_pos),
+  tot_val=VALUES(tot_val)
+"""
+
+snap_cursor = coll_snap.find({})
 count_snap = 0
-count_summary = 0
-count_quantum = 0
 
-for doc in snap_docs:
-    height    = doc['_id']        # int
+for doc in snap_cursor:
+    height = doc['_id']
     snap_date = doc.get('date', None)
-    # 这里snap_date可能是一个 datetime对象 或者字符串，看dat2mongo.py写入情况:
-    # 如果需要datetime，可能要做转换: snap_date.isoformat() 或者 str(snap_date)
-
     tot_val   = doc.get('tot-val', 0)
     op_return = doc.get('op-return', 0)
     unknown   = doc.get('unknown', 0)
@@ -100,67 +153,35 @@ for doc in snap_docs:
     un_frac   = doc.get('unknown-frac', 0.0)
 
     # 插入 snapshots
-    sql_snap = """
-    INSERT INTO snapshots
-      (height, snap_date, tot_val, op_return, unknown, qattack_frac, unknown_frac)
-    VALUES
-      (%s, %s, %s, %s, %s, %s, %s)
-    ON DUPLICATE KEY UPDATE
-      snap_date=VALUES(snap_date),
-      tot_val=VALUES(tot_val),
-      op_return=VALUES(op_return),
-      unknown=VALUES(unknown),
-      qattack_frac=VALUES(qattack_frac),
-      unknown_frac=VALUES(unknown_frac)
-    """
-    cursor.execute(sql_snap, (
-        height, snap_date, tot_val, op_return,
-        unknown, qattack, un_frac
-    ))
-    count_snap += 1
+    cursor.execute(sql_snap, (height, snap_date, tot_val, op_return, unknown, qattack, un_frac))
 
-    # ---------- summary-by-type ----------
+    # summary-by-type
     summary_array = doc.get('summary-by-type', [])
     for item in summary_array:
         addr_type = item.get('type', 'unknown')
         num_pos   = item.get('num-pos', 0)
         tv        = item.get('tot-val', 0)
-
-        sql_sum = """
-        INSERT INTO snapshot_summary_by_type
-          (snap_height, addr_type, num_pos, tot_val)
-        VALUES
-          (%s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-          num_pos=VALUES(num_pos),
-          tot_val=VALUES(tot_val)
-        """
         cursor.execute(sql_sum, (height, addr_type, num_pos, tv))
-        count_summary += 1
 
-    # ---------- quantum-by-type ----------
+    # quantum-by-type
     quantum_array = doc.get('quantum-by-type', [])
     for item in quantum_array:
         addr_type = item.get('type', 'unknown')
         num_pos   = item.get('num-pos', 0)
         tv        = item.get('tot-val', 0)
-
-        sql_q = """
-        INSERT INTO snapshot_quantum_by_type
-          (snap_height, addr_type, num_pos, tot_val)
-        VALUES
-          (%s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-          num_pos=VALUES(num_pos),
-          tot_val=VALUES(tot_val)
-        """
         cursor.execute(sql_q, (height, addr_type, num_pos, tv))
-        count_quantum += 1
 
+    count_snap += 1
+    # 如果想看进度，就随时print
+    if count_snap % 1000 == 0:
+        conn.commit()
+        progress = count_snap / snap_count_total * 100 if snap_count_total else 0
+        print(f"Processed {count_snap} / {snap_count_total} snapshots ({progress:.2f}%)", flush=True)
+
+# 提交剩余
 conn.commit()
-print(f"Done snapshots: {count_snap} rows.")
-print(f"Done summary-by-type: {count_summary} rows.")
-print(f"Done quantum-by-type: {count_quantum} rows.")
+
+print(f"Done snapshots: {count_snap} rows.\n")
 
 cursor.close()
 conn.close()
