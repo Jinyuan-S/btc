@@ -11,8 +11,9 @@ from struct import unpack
 # /dat/blk00000.dat
 
 # maximum file number (ignore last file because of possible orphans) / 最大文件数（忽略最后一个文件，因为可能有孤儿）
-MAX_FILE = 1
+MAX_FILE = 1234
 #MAX_FILE = 1
+file_path = 'E:/Prof Marco FYP Blockchain/data/blocks/blk%05d.dat'
 
 # flags for address types / 地址类型标志
 ADDR_UNKNOWN        = int(-1)
@@ -215,7 +216,7 @@ def reader_process(qread_unpack_l, qread_sync, f, b, fmax):
             except StopIteration:
                 # time to move to the next file / 是时候转到下一个文件了
                 if f.value < fmax:
-                    rdr = iter(get_blocks('./dat/blk%05d.dat' % f.value))
+                    rdr = iter(get_blocks(file_path % f.value))
                     f.value += 1
                 else:
                     # we are done here / 我们做完了
@@ -571,48 +572,21 @@ p_write = Process(target=writer_process, args=(qchild_write_l, qsync_write))
 T = datetime.now()
 
 if __name__ == "__main__":
-    # Initialize MongoDB with write concern and batch size optimizations
-    client = db.MongoClient(w=1, 
-                          journal=False, 
-                          maxPoolSize=200,
-                          maxIdleTimeMS=30000)
-    
-    # Start processes
     p_read.start()
-    p_unpack_l = [Process(target=unpacker_process, 
-                         args=(qread_unpack_l[i], qunpack_in_l[i], qunpack_hash_l[i])) 
-                  for i in range(NUM_UNPACKERS)]
-    
     for process in p_unpack_l:
         process.start()
-        
     p_hash.start()
     p_dist_in.start()
     p_dist_out.start()
-    
-    p_analyse_child_l = [Process(target=analysis_process_child, 
-                                args=(qin_child_l[i], qout_child_l[i], 
-                                     qchild_sync_l[i], qchild_write_l[i]))
-                        for i in range(NUM_ANALYZERS)]
-    
     for process in p_analyse_child_l:
         process.start()
-        
     p_sync.start()
     p_write.start()
 
-    # Add process monitoring
     while p_write.is_alive():
+        # status update on screen (every second) / 屏幕上的状态更新（每秒）
         time.sleep(1)
-        delta = datetime.now() - T
-        print(f'running time: {delta.seconds // 3600 + delta.days * 24:02d}:'
-              f'{(delta.seconds // 60) % 60:02d}:{delta.seconds % 60:02d}'
-              f'   input file: {f.value}/{MAX_FILE}'
-              f'   height: {h.value}/{b.value}'
-              f'   utxo size: {utxolen.value}\n', 
-              end='', flush=True)
 
-    # Clean up processes
-    for process in p_unpack_l + p_analyse_child_l + [p_read, p_hash, p_dist_in, 
-                                                    p_dist_out, p_sync, p_write]:
-        process.join()
+        delta = datetime.now() - T
+        print('running time: %02d:%02d:%02d' % (delta.seconds / (60*60) + delta.days * 24, (delta.seconds / 60) % 60, delta.seconds % 60) + '   input file: ' + str(f.value) + '/' + str(MAX_FILE) + '   height: ' + str(h.value)
+              + '/' + str(b.value) + '   utxo size: ' + str(utxolen.value) + '\n', end='', flush=True)
