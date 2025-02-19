@@ -1,6 +1,0 @@
-fastapi
-uvicorn
-motor
-sqlalchemy
-asyncmy
-pydantic-settings
