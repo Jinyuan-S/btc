@@ -1,6 +1,7 @@
 import pymongo
 import pymysql
 import math
+import os
 
 # ========== 配置部分 ==========
 MONGO_URI = "mongodb://localhost:27017"
@@ -12,10 +13,31 @@ MYSQL_HOST     = "127.0.0.1"
 MYSQL_PORT     = 3306
 MYSQL_USER     = "root"
 MYSQL_PASSWORD = "btcbtc"
-MYSQL_DB       = "btc"   # 你在MySQL中创建的数据库
+MYSQL_DB       = "btc_3"   # 你在MySQL中创建的数据库
 
 # 批量提交的大小
 BATCH_SIZE = 2000
+
+# 进度文件名
+PROGRESS_ADDR_FILE = "progress_addr.txt"
+PROGRESS_SNAP_FILE = "progress_snap.txt"
+
+# ========== 辅助函数：读取 / 保存进度 ==========
+
+def load_progress(filename):
+    """从本地文件读取已处理文档数量，若无则返回0"""
+    if not os.path.exists(filename):
+        return 0
+    with open(filename, 'r', encoding='utf-8') as f:
+        val = f.read().strip()
+        if val.isdigit():
+            return int(val)
+        return 0
+
+def save_progress(filename, count):
+    """把已处理文档数写入本地文件"""
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(str(count))
 
 # ========== 连接MongoDB ==========
 mongo_client = pymongo.MongoClient(MONGO_URI)
@@ -44,8 +66,14 @@ print(">>> Importing addresses ...")
 addr_count_total = coll_addr.count_documents({})
 print(f"Total addresses to process: {addr_count_total}")
 
-addr_cursor = coll_addr.find({})
-count_addr = 0
+# 读取上次的进度(已经处理多少条)
+progress_addr = load_progress(PROGRESS_ADDR_FILE)
+print(f"Resuming from addresses skip={progress_addr} ...")
+
+# 用skip跳过已经处理的文档
+addr_cursor = coll_addr.find({}).skip(progress_addr)
+count_addr = progress_addr  # 表示我们已经跳过了这部分
+
 batch_data = []
 
 sql_addr = """
@@ -85,28 +113,33 @@ for doc in addr_cursor:
         conn.commit()
         batch_data.clear()
 
+        # 保存进度
+        save_progress(PROGRESS_ADDR_FILE, count_addr)
+
         # 打印进度
-        progress = count_addr / addr_count_total * 100 if addr_count_total else 0
-        print(f"Processed {count_addr} / {addr_count_total} ({progress:.2f}%) addresses", flush=True)
+        progress_percent = count_addr / addr_count_total * 100 if addr_count_total else 0
+        print(f"Processed {count_addr} / {addr_count_total} ({progress_percent:.2f}%) addresses", flush=True)
 
 # 处理剩余不满一批的数据
 if batch_data:
     cursor.executemany(sql_addr, batch_data)
     conn.commit()
     batch_data.clear()
+    # 保存进度
+    save_progress(PROGRESS_ADDR_FILE, count_addr)
 
 print(f"Done addresses: {count_addr} rows inserted/updated.\n")
 
 
 # =====================================
-# 2. 导入快照 snapshots (示例：不做批插，可自己加批量逻辑)
+# 2. 导入快照 snapshots
 # =====================================
 print(">>> Importing snapshots ...")
 
 snap_count_total = coll_snap.count_documents({})
 print(f"Total snapshots to process: {snap_count_total}")
 
-sql_snap = """
+snap_sql = """
 INSERT INTO snapshots
   (height, snap_date, tot_val, op_return, unknown, qattack_frac, unknown_frac)
 VALUES
@@ -140,8 +173,15 @@ ON DUPLICATE KEY UPDATE
   tot_val=VALUES(tot_val)
 """
 
-snap_cursor = coll_snap.find({})
-count_snap = 0
+# 读取 snapshots 的进度
+progress_snap = load_progress(PROGRESS_SNAP_FILE)
+print(f"Resuming from snapshots skip={progress_snap} ...")
+
+snap_cursor = coll_snap.find({}).skip(progress_snap)
+count_snap = progress_snap
+
+batch_size_snap = 1000  # 你也可以用同一个BATCH_SIZE
+commit_counter = 0
 
 for doc in snap_cursor:
     height = doc['_id']
@@ -153,7 +193,7 @@ for doc in snap_cursor:
     un_frac   = doc.get('unknown-frac', 0.0)
 
     # 插入 snapshots
-    cursor.execute(sql_snap, (height, snap_date, tot_val, op_return, unknown, qattack, un_frac))
+    cursor.execute(snap_sql, (height, snap_date, tot_val, op_return, unknown, qattack, un_frac))
 
     # summary-by-type
     summary_array = doc.get('summary-by-type', [])
@@ -172,14 +212,21 @@ for doc in snap_cursor:
         cursor.execute(sql_q, (height, addr_type, num_pos, tv))
 
     count_snap += 1
-    # 如果想看进度，就随时print
-    if count_snap % 1000 == 0:
+    commit_counter += 1
+
+    # 每过一定数量commit一次，并保存进度
+    if commit_counter >= batch_size_snap:
         conn.commit()
-        progress = count_snap / snap_count_total * 100 if snap_count_total else 0
-        print(f"Processed {count_snap} / {snap_count_total} snapshots ({progress:.2f}%)", flush=True)
+        save_progress(PROGRESS_SNAP_FILE, count_snap)
+
+        progress_percent = count_snap / snap_count_total * 100 if snap_count_total else 0
+        print(f"Processed {count_snap} / {snap_count_total} snapshots ({progress_percent:.2f}%)", flush=True)
+
+        commit_counter = 0
 
 # 提交剩余
 conn.commit()
+save_progress(PROGRESS_SNAP_FILE, count_snap)
 
 print(f"Done snapshots: {count_snap} rows.\n")
 
