@@ -3,9 +3,9 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import select, and_
 from app.config import settings
-from app.models import Snapshot, SnapshotSummaryByType, SnapshotQuantumByType
+from app.models import Snapshot, SnapshotSummaryByType, SnapshotQuantumByType, Address
 from contextlib import asynccontextmanager
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field
 import logging
 import uvicorn
@@ -63,6 +63,7 @@ app = FastAPI(
         "email": "your.email@example.com",
     },
 )
+
 
 class AddressHistoryResponse(BaseModel):
     """
@@ -138,6 +139,57 @@ class AddressSummaryResponse(BaseModel):
                 "p2pkh_hidden": 7691.470119155041,
                 "p2sh_hidden": 2314.8207187882203,
                 "lost": 71.32284051986001
+            }
+        }
+
+class AddressResponse(BaseModel):
+    """
+    比特币地址信息响应模型
+    """
+    keyhash: str = Field(
+        description="公钥哈希",
+        example="1a2b3c4d..."
+    )
+    addr: str = Field(
+        description="Base58格式的比特币地址",
+        example="1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+    )
+    type: int = Field(
+        description="地址类型: 1=P2PK, 2=P2PK_comp, 10=P2PKH, 20=P2SH",
+        example=10
+    )
+    val: int = Field(
+        description="当前余额(单位: satoshi)",
+        example=5000000000
+    )
+    key_seen: int = Field(
+        description="公钥出现次数",
+        example=3
+    )
+    ins_count: int = Field(
+        description="接收交易次数",
+        example=10
+    )
+    outs_count: int = Field(
+        description="发送交易次数",
+        example=5
+    )
+    last_height: Optional[int] = Field(
+        description="最后活动的区块高度",
+        example=500000
+    )
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "keyhash": "1a2b3c4d...",
+                "addr": "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+                "type": 10,
+                "val": 5000000000,
+                "key_seen": 3,
+                "ins_count": 10,
+                "outs_count": 5,
+                "last_height": 500000
             }
         }
 
@@ -314,6 +366,72 @@ async def get_address_summary():
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(
+    "/api/address/{address}",
+    response_model=AddressResponse,
+    summary="获取比特币地址详细信息",
+    description="""
+    根据比特币地址查询详细信息，包括：
+    * 公钥哈希
+    * 地址类型
+    * 当前余额
+    * 公钥出现次数
+    * 交易统计
+    * 最后活动区块高度
+    
+    地址类型说明：
+    * 1 = P2PK (向公钥支付)
+    * 2 = P2PK_comp (压缩公钥)
+    * 10 = P2PKH (向公钥哈希支付)
+    * 20 = P2SH (向脚本哈希支付)
+    """,
+    response_description="包含地址详细信息的响应对象"
+)
+async def get_address_info(address: str):
+    """
+    获取指定比特币地址的详细信息。
+    
+    Args:
+        address: Base58格式的比特币地址
+        
+    Returns:
+        AddressResponse: 地址详细信息
+        
+    Raises:
+        HTTPException: 当地址不存在或发生其他错误时
+    """
+    try:
+        async with async_session() as session:
+            query = select(Address).where(Address.addr == address)
+            result = await session.execute(query)
+            address_info = result.scalar_one_or_none()
+            
+            if not address_info:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Address {address} not found"
+                )
+            
+            return AddressResponse(
+                keyhash=address_info.keyhash,
+                addr=address_info.addr,
+                type=address_info.type,
+                val=address_info.val,
+                key_seen=address_info.key_seen,
+                ins_count=address_info.ins_count,
+                outs_count=address_info.outs_count,
+                last_height=address_info.last_height
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error querying address {address}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error while querying address: {str(e)}"
+        )
 
 @app.get("/")
 async def root():

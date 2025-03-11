@@ -1,7 +1,20 @@
-from sqlalchemy import Column, Integer, String, TIMESTAMP, BigInteger, Float, ForeignKey
+from sqlalchemy import Column, Integer, String, TIMESTAMP, BigInteger, Float, ForeignKey, SmallInteger
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
+
+class Address(Base):
+    __tablename__ = "addresses"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    keyhash = Column(String(64), unique=True, nullable=False)
+    addr = Column(String(64))
+    type = Column(SmallInteger)  # TINYINT in MySQL maps to SmallInteger in SQLAlchemy
+    val = Column(BigInteger)
+    key_seen = Column(Integer, default=0)
+    ins_count = Column(Integer, default=0)
+    outs_count = Column(Integer, default=0)
+    last_height = Column(Integer)
 
 class Snapshot(Base):
     __tablename__ = "snapshots"
