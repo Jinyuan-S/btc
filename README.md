@@ -53,11 +53,101 @@ interface AddressSummaryResponse {
 
 ## 3. 修改了后端部分代码，实现以二进制向前端发送图片
 
-## 4. 新的数据库设计文件和dat2MySQL.py文件已上传，注意checkpoint文件是保存写入进度信息的，如果需要重新开始写入，需按顺序清空address, tx_inputs, tx_outputs, transactions, blocks表以及清空checkpoint.json中的全部内容
+## 4. 新的数据库设计文件(详细看下面的NEW Data Structure)和改进的dat2mysql.py文件已上传，目前已经优化到约20分钟插入一个完整的dat，采用多线程（默认4线程）分析dat到临时csv，然后用事务批量提交到数据库中，保证每个dat的数据都能完整写入到数据库。此外，程序支持随时中断，每次插入完一个完整的dat后，终端会提示用户是否继续，用户可以在5秒内输入非Y字符来正常结束程序；如果输入Y或没有任何输入，5秒之后程序继续，直到项目根目录下的/dat目录中所有dat被写入完毕。所有的临时csv都会在每个dat成功写入mysql后被清除，即使用户手动终止了程序，也会清除临时csv来释放硬盘空间。checkpoint会保存下一个要执行的dat文件，每次执行程序都会从这里开始，所以不要轻易修改或删除它。如果需要重新开始写入，需清空address, tx_inputs, tx_outputs, transactions, blocks表以及清空checkpoint.json中的全部内容（推荐使用以下命令快速清除大表数据）
+### a. use btc_analysis;
+### b.  SET FOREIGN_KEY_CHECKS = 0;
+### c. TRUNCATE TABLE address;
+### d. TRUNCATE TABLE tx_inputs;
+### e. TRUNCATE TABLE tx_outputs;
+### f. TRUNCATE TABLE transactions;
+### g. TRUNCATE TABLE blocks;
+### h. SET FOREIGN_KEY_CHECKS = 1;
+
+## 5. 执行脚本前，需要手动修改mysql的配置，windows可以找到my.ini配置文件，在[mysqld]的下面输入 local_infile=1 ，然后保存配置文件，重新启动mysql服务，这样可以允许mysql通过读取csv来批量插入数据。（默认是不允许的，所以要手动改配置文件）
+
+## 6. 执行dat2mysql.py脚本后，如果遇到类似“The total number of locks exceeds the lock table size”的错误，在mysql终端中输入以下命令：
+### a. show variables like "%_buffer%";
+### b. SET GLOBAL innodb_buffer_pool_size=67108864;   // 可以改为更大的值，这个是3x1024x1024x1024的大小
 
 
 
-# Data structure
+# NEW Data Structure
+
+```sql
+CREATE TABLE `address`  (
+  `address` varchar(50) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL,
+  `address_type` varchar(20) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL,
+  `total_received` bigint NOT NULL DEFAULT 0,
+  `total_sent` bigint NOT NULL DEFAULT 0,
+  `balance` bigint NOT NULL DEFAULT 0,
+  `pubkey_revealed` tinyint(1) NOT NULL DEFAULT 0,
+  `first_seen_block` char(64) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL,
+  `last_seen_block` char(64) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL,
+  PRIMARY KEY (`address`) USING BTREE
+) ENGINE = InnoDB CHARACTER SET = utf8 COLLATE = utf8_general_ci ROW_FORMAT = Dynamic;
+
+CREATE TABLE `blocks`  (
+  `block_hash` char(64) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL,
+  `version` int NOT NULL,
+  `prev_block_hash` char(64) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL,
+  `merkle_root` char(64) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL,
+  `timestamp` int NOT NULL,
+  `bits` int NOT NULL,
+  `nonce` int NOT NULL,
+  `block_size` int NOT NULL,
+  `tx_count` int NOT NULL,
+  `raw_block` longblob NOT NULL,
+  `file_name` varchar(50) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL,
+  `file_offset` bigint NULL DEFAULT NULL,
+  PRIMARY KEY (`block_hash`) USING BTREE
+) ENGINE = InnoDB CHARACTER SET = utf8 COLLATE = utf8_general_ci ROW_FORMAT = Dynamic;
+
+CREATE TABLE `transactions`  (
+  `txid` char(64) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL,
+  `block_hash` char(64) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL,
+  `version` int NOT NULL,
+  `input_count` int NOT NULL,
+  `output_count` int NOT NULL,
+  `lock_time` int NOT NULL,
+  `raw_tx` longblob NOT NULL,
+  PRIMARY KEY (`txid`) USING BTREE,
+  INDEX `idx_block_hash`(`block_hash` ASC) USING BTREE,
+  CONSTRAINT `fk_tx_block` FOREIGN KEY (`block_hash`) REFERENCES `blocks` (`block_hash`) ON DELETE RESTRICT ON UPDATE RESTRICT
+) ENGINE = InnoDB CHARACTER SET = utf8 COLLATE = utf8_general_ci ROW_FORMAT = Dynamic;
+
+DROP TABLE IF EXISTS `tx_inputs`;
+CREATE TABLE `tx_inputs`  (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `txid` char(64) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL,
+  `input_index` int NOT NULL,
+  `prev_txid` char(64) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL,
+  `prev_output_index` int NOT NULL,
+  `script_sig` longblob NOT NULL,
+  `sequence` bigint NOT NULL,
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_txid`(`txid` ASC) USING BTREE,
+  CONSTRAINT `fk_input_tx` FOREIGN KEY (`txid`) REFERENCES `transactions` (`txid`) ON DELETE RESTRICT ON UPDATE RESTRICT
+) ENGINE = InnoDB CHARACTER SET = utf8 COLLATE = utf8_general_ci ROW_FORMAT = Dynamic;
+
+CREATE TABLE `tx_outputs`  (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `txid` char(64) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL,
+  `output_index` int NOT NULL,
+  `value` bigint NOT NULL,
+  `script_pub_key` longblob NOT NULL,
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_txid`(`txid` ASC) USING BTREE,
+  CONSTRAINT `fk_output_tx` FOREIGN KEY (`txid`) REFERENCES `transactions` (`txid`) ON DELETE RESTRICT ON UPDATE RESTRICT
+) ENGINE = InnoDB CHARACTER SET = utf8 COLLATE = utf8_general_ci ROW_FORMAT = Dynamic;
+
+
+```
+
+
+
+
+
+# Old Data Structure
 
 ```sql
 CREATE TABLE addresses (
@@ -110,4 +200,5 @@ CREATE TABLE snapshot_summary_by_type (
 
 
 ```
+
 

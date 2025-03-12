@@ -3,17 +3,29 @@
 """
 dat2MySQL.py
 
-完整解析 Bitcoin dat 文件，将区块、交易、交易输入、交易输出、地址信息写入 MySQL 数据库。
+【分阶段方案】：
+  1. 并行解析 dat 文件，每批处理一定数量（例如 4 个）dat 文件，
+     将解析结果逐条写入临时 CSV 文件（逐条写入以降低内存占用），
+     并在每个进程中每 5% 打印一次进度提示。
+  2. 按 dat 文件顺序加载 CSV 数据到 MySQL 中（使用 LOAD DATA LOCAL INFILE）。
+
 要求：
-  1. 解析 dat 文件内所有信息，不遗漏。
-  2. 支持断点续传（记录下一个要处理的文件名及该文件内的偏移）。
-  3. 利用批量写入加速数据导入。
-  4. 自动衔接新 dat 文件。
-  5. 当一个文件处理完毕且无错误后，checkpoint 中的文件名自动 +1（格式保持一致）且 offset 重置为 0；
-     如果下一个文件不存在，则提示用户需要手动添加该文件，然后结束程序。
+  - 完整解析 dat 文件内所有信息（区块、交易、输入、输出、地址）。
+  - 支持断点续传：checkpoint 记录下一个待处理文件及 offset。
+  - 并行解析阶段采用多进程，每批处理固定数量（例如 4 个）dat 文件，
+    每个进程定期打印简要进度（每 5% 一次）。
+  - 加载阶段严格按 dat 文件顺序加载 CSV 数据到数据库中，保证数据顺序正确。
+  - 每个 dat 文件处理完毕后，checkpoint 自动更新为下一个文件（格式保持一致）且 offset 置 0；
+    如果下一个文件不存在，则提示用户手动添加后退出。
+  - 为加速 CSV 到 MySQL 的插入，在加载阶段禁用外键和唯一性检查，加载完成后恢复。
+  - 当某个 dat 文件完全加载完毕后，程序将倒计时 5 秒提示用户是否继续处理下一个文件：
+       用户输入 “Y” (不区分大小写) 并回车则继续处理，
+       输入其它或提前输入则程序终止，并清理所有临时 CSV 文件。
+       若 5 秒内无输入，则自动继续。
 """
 
 import os
+import sys
 import json
 import struct
 import logging
@@ -21,19 +33,14 @@ import hashlib
 import mysql.connector
 from mysql.connector import errorcode
 from io import BytesIO
-import sys
+import csv
+from multiprocessing import Pool, current_process
+import threading
+import time
 
 # ====== 配置区 ======
 DATA_DIR = "./dat"          # 存放 blk*.dat 文件的目录
 CHECKPOINT_FILE = "checkpoint.json"
-# 批量插入阈值（可根据实际情况调整）
-BATCH_SIZE_BLOCKS = 5
-BATCH_SIZE_TX = 500
-BATCH_SIZE_INPUT = 500
-BATCH_SIZE_OUTPUT = 500
-BATCH_SIZE_ADDRESS = 100
-
-# MySQL 连接配置
 DB_CONFIG = {
     "user": "root",
     "password": "gsj123",
@@ -41,8 +48,36 @@ DB_CONFIG = {
     "port": 3306,
     "database": "btc_analysis",
 }
+NUM_PROCESSES = 4          # 并行进程数
+BATCH_SIZE = 4             # 每批处理 dat 文件数量
+
+# 用于生成 CSV 的批量参数（较大值可减少 LOAD DATA 调用次数）
+BATCH_SIZE_BLOCKS = 10000
+BATCH_SIZE_TX = 10000
+BATCH_SIZE_INPUT = 10000
+BATCH_SIZE_OUTPUT = 10000
+BATCH_SIZE_ADDRESS = 5000
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+
+# ====== CSV 写入函数 ======
+def write_csv(filename, rows):
+    """将 rows 写入 CSV 文件"""
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+        for row in rows:
+            writer.writerow(row)
+
+# ====== 清理临时 CSV 文件 ======
+def cleanup_temp_csv():
+    """删除当前目录下所有以 'temp_' 开头、'.csv' 结尾的文件"""
+    for file in os.listdir('.'):
+        if file.startswith('temp_') and file.endswith('.csv'):
+            try:
+                os.remove(file)
+                logging.info(f"删除临时文件: {file}")
+            except Exception as e:
+                logging.error(f"删除临时文件 {file} 失败: {e}")
 
 # ====== Base58 与 Bech32 辅助函数 ======
 ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -65,7 +100,6 @@ def base58_check_encode(b: bytes) -> str:
     checksum = double_sha256(b)[:4]
     return base58_encode(b + checksum)
 
-# Bech32 实现（参考 BIP-0173）
 CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
 def bech32_polymod(values):
@@ -127,7 +161,7 @@ def read_varint(stream: BytesIO) -> int:
     elif i == 0xfe:
         data = stream.read(4)
         return int.from_bytes(data, 'little')
-    else:  # 0xff
+    else:
         data = stream.read(8)
         return int.from_bytes(data, 'little')
 
@@ -137,22 +171,18 @@ def double_sha256(data: bytes) -> bytes:
 
 # ====== 地址提取函数 ======
 def extract_address(script_hex: str):
-    # P2PKH: 76a914{20-byte-hash}88ac (50 hex字符)
     if script_hex.startswith("76a914") and script_hex.endswith("88ac") and len(script_hex) == 50:
         hash160 = bytes.fromhex(script_hex[6:46])
         addr = base58_check_encode(b'\x00' + hash160)
         return addr, "P2PKH"
-    # P2SH: a914{20-byte-hash}87 (46 hex字符)
     elif script_hex.startswith("a914") and script_hex.endswith("87") and len(script_hex) == 46:
         hash160 = bytes.fromhex(script_hex[4:44])
         addr = base58_check_encode(b'\x05' + hash160)
         return addr, "P2SH"
-    # P2WPKH: 0014{20-byte-hash} (44 hex字符)
     elif script_hex.startswith("0014") and len(script_hex) == 44:
         hash160 = bytes.fromhex(script_hex[4:44])
         addr = bech32_encode("bc", 0, list(hash160))
         return addr, "P2WPKH"
-    # P2WSH: 0020{32-byte-hash} (68 hex字符)
     elif script_hex.startswith("0020") and len(script_hex) == 68:
         hash256 = bytes.fromhex(script_hex[4:68])
         addr = bech32_encode("bc", 0, list(hash256))
@@ -162,11 +192,6 @@ def extract_address(script_hex: str):
 
 # ====== 解析交易、区块 ======
 def parse_transaction(stream: BytesIO) -> (dict, bytes):
-    """
-    解析交易：
-      version (4字节) | tx_in_count (varint) | 每个输入 | tx_out_count (varint) | 每个输出 | lock_time (4字节)
-    返回交易数据及原始字节
-    """
     tx_start = stream.tell()
     try:
         version_bytes = stream.read(4)
@@ -216,18 +241,11 @@ def parse_transaction(stream: BytesIO) -> (dict, bytes):
         "outputs": outputs,
         "txid": txid,
         "input_count": in_count,
-        "output_count": out_count,
+        "output_count": len(outputs),
     }
     return tx, tx_raw
 
 def parse_block(file_obj, file_name: str) -> dict:
-    """
-    解析一个区块：
-      先读取8字节 (magic + length)，再读取整个区块数据。
-    返回字典包含：
-      block_hash, version, prev_block_hash, merkle_root, timestamp, bits, nonce, block_size, tx_count, raw_block, transactions,
-      以及数据来源 file_name 和 file_offset。
-    """
     start_offset = file_obj.tell()
     header = file_obj.read(8)
     if len(header) < 8:
@@ -243,7 +261,6 @@ def parse_block(file_obj, file_name: str) -> dict:
         return None
     raw_block = header + block_data
     block_size = len(raw_block)
-
     if len(block_data) < 80:
         logging.info(f"区块数据太短，无法解析区块头，在 {file_name} offset {start_offset}。")
         return None
@@ -255,7 +272,6 @@ def parse_block(file_obj, file_name: str) -> dict:
     bits = int.from_bytes(block_header[72:76], 'little')
     nonce = int.from_bytes(block_header[76:80], 'little')
     block_hash = double_sha256(block_header)[::-1].hex()
-
     stream = BytesIO(block_data)
     stream.seek(80)
     try:
@@ -296,12 +312,157 @@ def parse_block(file_obj, file_name: str) -> dict:
         "file_offset": start_offset,
     }
 
+# ====== update_local_address 函数 ======
+def update_local_address(address_dict, addr, received=0, sent=0, block_hash=None, addr_type="unknown", pubkey_flag=0):
+    if addr not in address_dict:
+        address_dict[addr] = {
+            "address": addr,
+            "address_type": addr_type,
+            "total_received": received,
+            "total_sent": sent,
+            "balance": received - sent,
+            "pubkey_revealed": pubkey_flag,
+            "first_seen_block": block_hash,
+            "last_seen_block": block_hash,
+        }
+    else:
+        rec = address_dict[addr]
+        rec["total_received"] += received
+        rec["total_sent"] += sent
+        rec["balance"] = rec["total_received"] - rec["total_sent"]
+        rec["last_seen_block"] = block_hash
+        if pubkey_flag:
+            rec["pubkey_revealed"] = 1
+
+# ====== prompt_continue 函数 ======
+def prompt_continue(timeout=5):
+    """提示用户是否继续处理下一个 dat 文件，等待 timeout 秒
+       提示：输入 Y 回车继续，其他输入或超时则终止程序。"""
+    print("是否继续处理下一个文件？(Y/N): ", end="", flush=True)
+    result = []
+    def get_input():
+        result.append(sys.stdin.readline().strip())
+    t = threading.Thread(target=get_input)
+    t.daemon = True
+    t.start()
+    t.join(timeout)
+    if result:
+        if result[0].lower() == 'y':
+            return True
+        else:
+            return False
+    else:
+        return True
+
+# ====== 并行解析阶段：Worker函数 ======
+def parse_dat_file(filename):
+    blocks_csv = f"temp_{filename}_blocks.csv"
+    tx_csv = f"temp_{filename}_tx.csv"
+    inputs_csv = f"temp_{filename}_inputs.csv"
+    outputs_csv = f"temp_{filename}_outputs.csv"
+    address_csv = f"temp_{filename}_address.csv"
+    blocks_file = open(blocks_csv, "w", newline="", encoding="utf-8")
+    tx_file = open(tx_csv, "w", newline="", encoding="utf-8")
+    inputs_file = open(inputs_csv, "w", newline="", encoding="utf-8")
+    outputs_file = open(outputs_csv, "w", newline="", encoding="utf-8")
+    address_file = open(address_csv, "w", newline="", encoding="utf-8")
+    blocks_writer = csv.writer(blocks_file, quoting=csv.QUOTE_MINIMAL)
+    tx_writer = csv.writer(tx_file, quoting=csv.QUOTE_MINIMAL)
+    inputs_writer = csv.writer(inputs_file, quoting=csv.QUOTE_MINIMAL)
+    outputs_writer = csv.writer(outputs_file, quoting=csv.QUOTE_MINIMAL)
+    address_writer = csv.writer(address_file, quoting=csv.QUOTE_MINIMAL)
+
+    local_address = {}
+    local_utxo = {}
+    file_path = os.path.join(DATA_DIR, filename)
+    file_size = os.path.getsize(file_path)
+    progress_last = 0
+    proc_id = current_process().pid
+    try:
+        with open(file_path, "rb") as f:
+            while True:
+                cur = f.tell()
+                if file_size > 0:
+                    progress = (cur / file_size) * 100
+                    if progress - progress_last >= 5:
+                        logging.info(f"进程 {proc_id} 处理文件 {filename}: {progress:.1f}%")
+                        progress_last = progress
+                block = parse_block(f, filename)
+                if block is None:
+                    break
+                blocks_writer.writerow([
+                    block["block_hash"],
+                    block["version"],
+                    block["prev_block_hash"],
+                    block["merkle_root"],
+                    block["timestamp"],
+                    block["bits"],
+                    block["nonce"],
+                    block["block_size"],
+                    block["tx_count"],
+                    block["raw_block"].hex(),
+                    block["file_name"],
+                    block["file_offset"],
+                ])
+                for tx in block["transactions"]:
+                    tx_writer.writerow([
+                        tx["txid"],
+                        block["block_hash"],
+                        tx["version"],
+                        tx["input_count"],
+                        tx["output_count"],
+                        tx["lock_time"],
+                        tx["raw_tx"].hex(),
+                    ])
+                    for idx_in, txin in enumerate(tx["inputs"]):
+                        inputs_writer.writerow([
+                            tx["txid"],
+                            idx_in,
+                            txin["prev_txid"],
+                            txin["prev_index"],
+                            txin["script_sig"],
+                            txin["sequence"],
+                        ])
+                        if txin["prev_txid"] != "0"*64:
+                            key = (txin["prev_txid"], txin["prev_index"])
+                            if key in local_utxo:
+                                addr, value = local_utxo.pop(key)
+                                update_local_address(local_address, addr, sent=value, block_hash=block["block_hash"])
+                    for idx_out, txout in enumerate(tx["outputs"]):
+                        outputs_writer.writerow([
+                            tx["txid"],
+                            idx_out,
+                            txout["value"],
+                            txout["script_pub_key"],
+                        ])
+                        addr, addr_type = extract_address(txout["script_pub_key"])
+                        if addr:
+                            update_local_address(local_address, addr, received=txout["value"], block_hash=block["block_hash"], addr_type=addr_type)
+                            local_utxo[(tx["txid"], idx_out)] = (addr, txout["value"])
+    except Exception as e:
+        logging.error(f"解析文件 {filename} 时出错：{e}")
+        raise e
+    for rec in local_address.values():
+        address_writer.writerow([
+            rec["address"],
+            rec["address_type"],
+            rec["total_received"],
+            rec["total_sent"],
+            rec["balance"],
+            rec["pubkey_revealed"],
+            rec["first_seen_block"],
+            rec["last_seen_block"],
+        ])
+    blocks_file.close()
+    tx_file.close()
+    inputs_file.close()
+    outputs_file.close()
+    address_file.close()
+    logging.info(f"文件 {filename} 解析完毕，生成CSV文件。")
+    return {"blocks": blocks_csv, "tx": tx_csv, "inputs": inputs_csv, "outputs": outputs_csv, "address": address_csv}, filename
+
 # ====== 断点续传相关 ======
 def load_checkpoint() -> dict:
-    """
-    加载 checkpoint。如果不存在或为空，则返回初始值，
-    表示从 "blk00000.dat" 开始、offset 为 0。
-    """
     if os.path.exists(CHECKPOINT_FILE):
         try:
             with open(CHECKPOINT_FILE, "r") as f:
@@ -316,10 +477,6 @@ def load_checkpoint() -> dict:
         return {"next_file": "blk00000.dat", "offset": 0}
 
 def save_checkpoint(next_file: str, offset: int):
-    """
-    保存 checkpoint，其中 next_file 为下一个要处理的 dat 文件，
-    offset 为该文件中的偏移位置。
-    """
     checkpoint = {"next_file": next_file, "offset": offset}
     with open(CHECKPOINT_FILE, "w") as f:
         json.dump(checkpoint, f)
@@ -330,9 +487,6 @@ def get_dat_files() -> list:
     return files
 
 def get_next_filename(current_file: str) -> str:
-    """
-    根据当前文件名计算下一个文件名，假设格式为 "blkNNNNN.dat"。
-    """
     try:
         num = int(current_file[3:8])
     except Exception:
@@ -340,226 +494,131 @@ def get_next_filename(current_file: str) -> str:
     next_num = num + 1
     return f"blk{next_num:05d}.dat"
 
-# ====== SQL 语句 ======
+# ====== SQL 语句模板 ======
 INSERT_BLOCK_SQL = (
-    "INSERT IGNORE INTO blocks "
-    "(block_hash, version, prev_block_hash, merkle_root, timestamp, bits, nonce, block_size, tx_count, raw_block, file_name, file_offset) "
-    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    "LOAD DATA LOCAL INFILE '{csv_file}' "
+    "INTO TABLE blocks "
+    "FIELDS TERMINATED BY ',' ENCLOSED BY '\"' ESCAPED BY '\\\\' "
+    "LINES TERMINATED BY '\\n' "
+    "(block_hash, version, prev_block_hash, merkle_root, timestamp, bits, nonce, block_size, tx_count, @raw_block, file_name, file_offset) "
+    "SET raw_block = UNHEX(@raw_block)"
 )
 INSERT_TX_SQL = (
-    "INSERT IGNORE INTO transactions "
-    "(txid, block_hash, version, input_count, output_count, lock_time, raw_tx) "
-    "VALUES (%s, %s, %s, %s, %s, %s, %s)"
+    "LOAD DATA LOCAL INFILE '{csv_file}' "
+    "INTO TABLE transactions "
+    "FIELDS TERMINATED BY ',' ENCLOSED BY '\"' ESCAPED BY '\\\\' "
+    "LINES TERMINATED BY '\\n' "
+    "(txid, block_hash, version, input_count, output_count, lock_time, @raw_tx) "
+    "SET raw_tx = UNHEX(@raw_tx)"
 )
 INSERT_INPUT_SQL = (
-    "INSERT IGNORE INTO tx_inputs "
-    "(txid, input_index, prev_txid, prev_output_index, script_sig, sequence) "
-    "VALUES (%s, %s, %s, %s, %s, %s)"
+    "LOAD DATA LOCAL INFILE '{csv_file}' "
+    "INTO TABLE tx_inputs "
+    "FIELDS TERMINATED BY ',' ENCLOSED BY '\"' ESCAPED BY '\\\\' "
+    "LINES TERMINATED BY '\\n' "
+    "(txid, input_index, prev_txid, prev_output_index, @script_sig, sequence) "
+    "SET script_sig = UNHEX(@script_sig)"
 )
 INSERT_OUTPUT_SQL = (
-    "INSERT IGNORE INTO tx_outputs "
-    "(txid, output_index, value, script_pub_key) "
-    "VALUES (%s, %s, %s, %s)"
+    "LOAD DATA LOCAL INFILE '{csv_file}' "
+    "INTO TABLE tx_outputs "
+    "FIELDS TERMINATED BY ',' ENCLOSED BY '\"' ESCAPED BY '\\\\' "
+    "LINES TERMINATED BY '\\n' "
+    "(txid, output_index, value, @script_pub_key) "
+    "SET script_pub_key = UNHEX(@script_pub_key)"
 )
 INSERT_ADDRESS_SQL = (
-    "INSERT INTO address (address, address_type, total_received, total_sent, balance, pubkey_revealed, first_seen_block, last_seen_block) "
-    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
-    "ON DUPLICATE KEY UPDATE "
-    "total_received = total_received + VALUES(total_received), "
-    "total_sent = total_sent + VALUES(total_sent), "
-    "balance = (total_received + VALUES(total_received)) - (total_sent + VALUES(total_sent)), "
-    "last_seen_block = VALUES(last_seen_block), "
-    "pubkey_revealed = GREATEST(pubkey_revealed, VALUES(pubkey_revealed))"
+    "LOAD DATA LOCAL INFILE '{csv_file}' "
+    "REPLACE INTO TABLE address "
+    "FIELDS TERMINATED BY ',' ENCLOSED BY '\"' ESCAPED BY '\\\\' "
+    "LINES TERMINATED BY '\\n' "
+    "(address, address_type, total_received, total_sent, balance, pubkey_revealed, first_seen_block, last_seen_block)"
 )
 
-# ====== 全局数据结构 ======
-utxo = {}          # key: (txid, output_index) -> (address, value)
-address_updates = {}  # key: address -> 更新数据字典
+def load_csv(cursor, csv_file, load_sql):
+    abs_path = os.path.abspath(csv_file).replace("\\", "/")
+    cmd = load_sql.replace("{csv_file}", abs_path)
+    logging.info(f"执行SQL：{cmd[:100]}...")
+    cursor.execute(cmd)
 
-def update_address(addr, addr_type, received=0, sent=0, block_hash=None, pubkey_flag=0):
-    if addr is None:
-        return
-    if addr not in address_updates:
-        address_updates[addr] = {
-            "address": addr,
-            "address_type": addr_type if addr_type else "unknown",
-            "total_received": received,
-            "total_sent": sent,
-            "balance": received - sent,
-            "pubkey_revealed": pubkey_flag,
-            "first_seen_block": block_hash,
-            "last_seen_block": block_hash,
-        }
-    else:
-        rec = address_updates[addr]
-        rec["total_received"] += received
-        rec["total_sent"] += sent
-        rec["balance"] = rec["total_received"] - rec["total_sent"]
-        rec["last_seen_block"] = block_hash
-        if pubkey_flag:
-            rec["pubkey_revealed"] = 1
-
-def flush_address_updates(cursor):
-    global address_updates
-    if not address_updates:
-        return
-    batch = []
-    for rec in address_updates.values():
-        batch.append((
-            rec["address"],
-            rec["address_type"],
-            rec["total_received"],
-            rec["total_sent"],
-            rec["balance"],
-            rec["pubkey_revealed"],
-            rec["first_seen_block"],
-            rec["last_seen_block"],
-        ))
-    try:
-        cursor.executemany(INSERT_ADDRESS_SQL, batch)
-    except Exception as e:
-        logging.error(f"地址批量更新错误: {e}")
-    address_updates = {}
-
-# ====== 主处理逻辑 ======
+# ====== 主流程 ======
 def main():
+    # 批处理方式：每批处理 BATCH_SIZE 个文件，避免临时 CSV 占用过多磁盘空间
     checkpoint = load_checkpoint()
     logging.info(f"加载 checkpoint: {checkpoint}")
     dat_files = get_dat_files()
     if not dat_files:
         logging.error("数据目录中未发现 blk*.dat 文件。")
         return
-
-    # 如果 checkpoint 中指定的 next_file 不存在于目录中，则提示并退出
     next_file = checkpoint.get("next_file", "blk00000.dat")
     if next_file not in dat_files:
         logging.warning(f"下一个要处理的文件 {next_file} 不存在，请手动添加到目录中。")
         sys.exit(1)
-
     start_index = dat_files.index(next_file)
-    total_files = len(dat_files)
+    logging.info(f"从文件 {dat_files[start_index]} 开始处理，共 {len(dat_files) - start_index} 个文件。")
 
-    try:
-        cnx = mysql.connector.connect(**DB_CONFIG)
-        cursor = cnx.cursor()
-        logging.info("成功连接到 MySQL 数据库。")
-    except mysql.connector.Error as err:
-        logging.error(f"连接 MySQL 出错: {err}")
-        return
+    # 分批处理
+    for i in range(start_index, len(dat_files), BATCH_SIZE):
+        batch = dat_files[i:i+BATCH_SIZE]
+        logging.info(f"开始并行解析批次：{batch}")
+        with Pool(processes=NUM_PROCESSES) as pool:
+            results = pool.map(parse_dat_file, batch)
+        results.sort(key=lambda x: x[1])
 
-    block_batch = []
-    tx_batch = []
-    input_batch = []
-    output_batch = []
-
-    def flush_batches():
-        nonlocal block_batch, tx_batch, input_batch, output_batch
+        # 顺序加载阶段：加载当前批次各文件的 CSV 数据
         try:
-            if block_batch:
-                cursor.executemany(INSERT_BLOCK_SQL, block_batch)
-                block_batch = []
-            if tx_batch:
-                cursor.executemany(INSERT_TX_SQL, tx_batch)
-                tx_batch = []
-            if input_batch:
-                cursor.executemany(INSERT_INPUT_SQL, input_batch)
-                input_batch = []
-            if output_batch:
-                cursor.executemany(INSERT_OUTPUT_SQL, output_batch)
-                output_batch = []
-            flush_address_updates(cursor)
-            cnx.commit()
+            conn = mysql.connector.connect(**DB_CONFIG, allow_local_infile=True)
+            cursor = conn.cursor()
+            logging.info("成功连接到 MySQL 数据库。")
+            # 禁用外键和唯一性检查以加速加载
+            cursor.execute("SET foreign_key_checks = 0;")
+            cursor.execute("SET unique_checks = 0;")
+            cursor.execute("SET innodb_lock_wait_timeout = 300;")
         except mysql.connector.Error as err:
-            logging.error(f"批量插入错误: {err}")
-            cnx.rollback()
+            logging.error(f"连接 MySQL 出错: {err}")
+            return
 
-    for idx in range(start_index, total_files):
-        current_file = dat_files[idx]
-        logging.info(f"处理文件 {idx+1}/{total_files}: {current_file}")
-        file_path = os.path.join(DATA_DIR, current_file)
-        with open(file_path, "rb") as file_obj:
-            if idx == start_index:
-                file_obj.seek(checkpoint["offset"])
+        for idx, (csv_files, dat_filename) in enumerate(results):
+            logging.info(f"加载数据文件 {dat_filename} 到数据库。")
+            try:
+                load_csv(cursor, csv_files["blocks"], INSERT_BLOCK_SQL)
+                conn.commit()
+                load_csv(cursor, csv_files["tx"], INSERT_TX_SQL)
+                conn.commit()
+                load_csv(cursor, csv_files["inputs"], INSERT_INPUT_SQL)
+                conn.commit()
+                load_csv(cursor, csv_files["outputs"], INSERT_OUTPUT_SQL)
+                conn.commit()
+                load_csv(cursor, csv_files["address"], INSERT_ADDRESS_SQL)
+                conn.commit()
+            except Exception as e:
+                logging.error(f"加载CSV数据出错: {e}")
+                conn.rollback()
+                cursor.close()
+                conn.close()
+                cleanup_temp_csv()
+                sys.exit(1)
+            for f in csv_files.values():
+                if os.path.exists(f):
+                    os.remove(f)
+            next_file_candidate = get_next_filename(dat_filename)
+            logging.info(f"数据文件 {dat_filename} 加载完毕，更新 checkpoint，下一文件应为: {next_file_candidate}")
+            save_checkpoint(next_file_candidate, 0)
+            next_file_path = os.path.join(DATA_DIR, next_file_candidate)
+            # 如果下一个文件存在，则提示用户是否继续
+            if os.path.exists(next_file_path):
+                if not prompt_continue(timeout=5):
+                    logging.info("用户选择终止程序，正在清理临时文件...")
+                    cleanup_temp_csv()
+                    sys.exit(0)
             else:
-                file_obj.seek(0)
-            while True:
-                cur_offset = file_obj.tell()
-                block = parse_block(file_obj, current_file)
-                if block is None:
-                    break
-                block_tuple = (
-                    block["block_hash"],
-                    block["version"],
-                    block["prev_block_hash"],
-                    block["merkle_root"],
-                    block["timestamp"],
-                    block["bits"],
-                    block["nonce"],
-                    block["block_size"],
-                    block["tx_count"],
-                    block["raw_block"],
-                    block["file_name"],
-                    block["file_offset"],
-                )
-                block_batch.append(block_tuple)
-                for tx in block["transactions"]:
-                    tx_tuple = (
-                        tx["txid"],
-                        block["block_hash"],
-                        tx["version"],
-                        tx["input_count"],
-                        tx["output_count"],
-                        tx["lock_time"],
-                        tx["raw_tx"],
-                    )
-                    tx_batch.append(tx_tuple)
-                    for idx_in, txin in enumerate(tx["inputs"]):
-                        input_tuple = (
-                            tx["txid"],
-                            idx_in,
-                            txin["prev_txid"],
-                            txin["prev_index"],
-                            txin["script_sig"],
-                            txin["sequence"],
-                        )
-                        input_batch.append(input_tuple)
-                        if txin["prev_txid"] != "0"*64:
-                            key = (txin["prev_txid"], txin["prev_index"])
-                            if key in utxo:
-                                addr, value = utxo.pop(key)
-                                update_address(addr, None, sent=value, block_hash=block["block_hash"])
-                    for idx_out, txout in enumerate(tx["outputs"]):
-                        output_tuple = (
-                            tx["txid"],
-                            idx_out,
-                            txout["value"],
-                            txout["script_pub_key"],
-                        )
-                        output_batch.append(output_tuple)
-                        addr, addr_type = extract_address(txout["script_pub_key"])
-                        if addr:
-                            update_address(addr, addr_type, received=txout["value"], block_hash=block["block_hash"])
-                            utxo[(tx["txid"], idx_out)] = (addr, txout["value"])
-                if len(block_batch) >= BATCH_SIZE_BLOCKS:
-                    flush_batches()
-                    save_checkpoint(current_file, file_obj.tell())
-                if len(tx_batch) >= BATCH_SIZE_TX or len(input_batch) >= BATCH_SIZE_INPUT or len(output_batch) >= BATCH_SIZE_OUTPUT:
-                    flush_batches()
-                save_checkpoint(current_file, file_obj.tell())
-        logging.info(f"文件 {current_file} 处理完毕。")
-        # 文件处理完毕后，计算下一个文件名，并更新 checkpoint
-        next_file = get_next_filename(current_file)
-        next_file_path = os.path.join(DATA_DIR, next_file)
-        if not os.path.exists(next_file_path):
-            logging.warning(f"下一个文件 {next_file} 不存在，请手动添加到目录中。")
-            save_checkpoint(next_file, 0)
-            break
-        else:
-            save_checkpoint(next_file, 0)
-    flush_batches()
-    # 不再重置 checkpoint，保持最新 checkpoint
-    cursor.close()
-    cnx.close()
+                logging.warning(f"下一个文件 {next_file_candidate} 不存在，请手动添加到目录中。")
+                break
+
+        cursor.execute("SET foreign_key_checks = 1;")
+        cursor.execute("SET unique_checks = 1;")
+        cursor.close()
+        conn.close()
     logging.info("全部数据导入完成。")
 
 if __name__ == "__main__":
