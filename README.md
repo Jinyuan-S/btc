@@ -51,6 +51,9 @@ interface AddressSummaryResponse {
 }
 ```
 
+## 3. 修改了后端部分代码，实现以二进制向前端发送图片
+
+## 4. 新的数据库设计文件和dat2MySQL.py文件已上传，注意checkpoint文件是保存写入进度信息的，如果需要重新开始写入，需按顺序清空address, tx_inputs, tx_outputs, transactions, blocks表以及清空checkpoint.json中的全部内容
 
 
 
@@ -108,5 +111,3 @@ CREATE TABLE snapshot_summary_by_type (
 
 ```
 
-last time accessed.
-fist time accessed.

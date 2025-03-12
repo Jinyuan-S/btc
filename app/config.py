@@ -3,11 +3,11 @@ from typing import Optional
 
 class Settings(BaseSettings):
     # MySQL配置
-    MYSQL_USER: str
-    MYSQL_PASSWORD: str
-    MYSQL_HOST: str
-    MYSQL_PORT: int
-    MYSQL_DB: str
+    MYSQL_USER: str = "root"
+    MYSQL_PASSWORD: str = "gsj123"
+    MYSQL_HOST: str = "localhost"
+    MYSQL_PORT: int = 3306
+    MYSQL_DB: str = "btc"
     
     @property
     def MYSQL_URL(self) -> str:
