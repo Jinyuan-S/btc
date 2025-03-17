@@ -11,6 +11,12 @@ MYSQL_PORT=
 MYSQL_DB=
 ```
 
+## How to run backend
+
+```bash
+python -m app.main
+```
+
 ## UI 文档
 `http://localhost:8000/docs`: 交互式swagger ui doc
 `http://localhost:8000/redoc`: ReDoc文档

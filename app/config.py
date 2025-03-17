@@ -4,10 +4,10 @@ from typing import Optional
 class Settings(BaseSettings):
     # MySQL配置
     MYSQL_USER: str = "root"
-    MYSQL_PASSWORD: str = "gsj123"
-    MYSQL_HOST: str = "localhost"
+    MYSQL_PASSWORD: str = "btcbtc"
+    MYSQL_HOST: str = "10.248.8.247"
     MYSQL_PORT: int = 3306
-    MYSQL_DB: str = "btc"
+    MYSQL_DB: str = "btc_analysis"
     
     @property
     def MYSQL_URL(self) -> str:
