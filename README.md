@@ -16,6 +16,7 @@ MYSQL_DB=
 ```bash
 python -m app.main
 ```
+cd $(pwd) && uvicorn app.main:app --reload
 
 ## UI 文档
 `http://localhost:8000/docs`: 交互式swagger ui doc
@@ -148,8 +149,76 @@ CREATE TABLE `tx_outputs`  (
 
 
 ```
+## Speed up strategy
 
+1. Add critical indexes
+```sql
+-- Index for tx_outputs (for UTXO lookup)
+CREATE INDEX idx_tx_outputs_txid_output_index ON tx_outputs(txid, output_index);
 
+-- Index for tx_inputs (for spent output lookup)
+CREATE INDEX idx_tx_inputs_prev_txid_prev_output_index ON tx_inputs(prev_txid, prev_output_index);
+
+-- Index for timestamp ordering in blocks
+CREATE INDEX idx_blocks_timestamp ON blocks(timestamp);
+
+-- Index for script_pub_key to speed up address type identification
+CREATE INDEX idx_tx_outputs_script_pub_key ON tx_outputs(script_pub_key(32));
+```
+
+2. 改 Mysql configuration
+
+```
+[mysqld]
+innodb_buffer_pool_size = 4G           # Allocate more memory to buffer pool
+innodb_log_file_size = 512M            # Larger log file for transactions
+max_allowed_packet = 256M              # For larger queries
+wait_timeout = 300                     # Longer connection timeout
+interactive_timeout = 300              # Longer interactive timeout
+net_read_timeout = 180                 # Longer read timeout
+```
+
+3. 
+
+- Database Optimizations
+  - Added Critical Indexes:
+    Created indexes for tx_outputs, tx_inputs, and blocks tables
+    These indexes are automatically created during app startup
+    Specifically optimized for the UTXO lookups that were causing timeouts
+  - Database Connection Improvements:
+    Increased connection timeouts and read/write timeouts
+    Added pool_pre_ping for healthier connections
+    Optimized pool sizes for better concurrency
+- Code Optimizations
+  - Query Optimization:
+    Used temporary tables for large UTXO queries to reduce memory usage
+    Implemented batch processing to avoid memory overflows
+    Added LIMIT clauses to prevent runaway queries
+    Used sampling techniques for the large address summary query
+  - Caching:
+    Added a time-based caching system (1-hour expiry by default)
+    Cached analysis results to avoid redundant calculations
+    Implemented LRU caching for expensive script interpretation functions
+  - Script Analysis Improvements:
+    Simplified multisig script parsing for better performance
+    Added shortcuts for common patterns in script analysis
+    Used statistical approaches instead of querying each address individually
+  - Error Handling:
+    Added timeout protection for long-running queries
+    Improved error diagnostics, especially for connection issues
+    Added specific HTTP status codes for different error types
+  - isualization Improvements:
+    Enhanced chart visual quality
+    Optimized chart rendering for better performance
+    Added better styling while keeping file sizes reasonable
+- Other Enhancements
+  - Dependency Injection:
+    Used FastAPI's dependency injection system for database sessions
+    Improved transaction management and error handling
+  - Statistical Approximation:
+    For extremely large datasets, used sampling and statistical approximation
+    This allows the API to provide reasonably accurate results without processing all data
+    These optimizations should significantly improve response times and solve the connection timeout errors you were experiencing.
 
 
 
