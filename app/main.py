@@ -22,6 +22,10 @@ import asyncio
 from datetime import datetime, timedelta
 import time
 
+# Add tqdm for progress tracking in logs
+import sys
+from datetime import datetime
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -452,6 +456,80 @@ async def get_utxos_at_timestamp(session, timestamp, limit=100000):
         logger.error(f"Error in get_utxos_at_timestamp: {e}")
         return []
 
+# Create a progress logger helper class
+class ProgressLogger:
+    """Simple progress logger that displays progress in logs"""
+    def __init__(self, total, description="Progress", log_interval=5):
+        self.total = total
+        self.description = description
+        self.current = 0
+        self.start_time = datetime.now()
+        self.log_interval = log_interval
+        self.last_log_time = self.start_time
+        self.last_percentage = 0
+        
+        # Initial progress message
+        logger.info(f"{self.description}: 0% [{'.' * 30}] (0/{self.total})")
+    
+    def update(self, increment=1):
+        """Update progress and log if necessary"""
+        self.current += increment
+        current_time = datetime.now()
+        current_percentage = int((self.current / self.total) * 100)
+        
+        # Only log if enough time has passed or percentage change is significant
+        time_diff = (current_time - self.last_log_time).total_seconds()
+        if (time_diff >= self.log_interval or 
+            current_percentage >= 100 or 
+            current_percentage - self.last_percentage >= 5):
+            
+            # Calculate elapsed and estimated time
+            elapsed = current_time - self.start_time
+            elapsed_seconds = elapsed.total_seconds()
+            if self.current > 0:
+                estimated_total = elapsed_seconds * (self.total / self.current)
+                remaining = max(0, estimated_total - elapsed_seconds)
+                
+                # Format for display
+                elapsed_str = self._format_time(elapsed_seconds)
+                remaining_str = self._format_time(remaining)
+                
+                # Create progress bar
+                progress_bar_length = 30
+                completed_length = int(progress_bar_length * self.current / self.total)
+                progress_bar = '#' * completed_length + '.' * (progress_bar_length - completed_length)
+                
+                # Log progress
+                logger.info(
+                    f"{self.description}: {current_percentage}% [{progress_bar}] "
+                    f"({self.current}/{self.total}) "
+                    f"| Elapsed: {elapsed_str} | Remaining: {remaining_str}"
+                )
+                
+                # Update last log time and percentage
+                self.last_log_time = current_time
+                self.last_percentage = current_percentage
+    
+    def _format_time(self, seconds):
+        """Format seconds to readable time string"""
+        minutes, seconds = divmod(int(seconds), 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours > 0:
+            return f"{hours}h {minutes}m {seconds}s"
+        elif minutes > 0:
+            return f"{minutes}m {seconds}s"
+        else:
+            return f"{seconds}s"
+    
+    def finish(self):
+        """Mark the progress as complete"""
+        elapsed = (datetime.now() - self.start_time).total_seconds()
+        logger.info(
+            f"{self.description}: 100% [{'#' * 30}] "
+            f"({self.total}/{self.total}) | "
+            f"Total time: {self._format_time(elapsed)}"
+        )
+
 async def analyze_block_data(session, max_height=MAX_HEIGHT, use_cache=True):
     """
     Analyze blockchain data and return statistics about address types and balances
@@ -481,7 +559,9 @@ async def analyze_block_data(session, max_height=MAX_HEIGHT, use_cache=True):
         
         # Calculate sampling points - increased interval for very large datasets
         sample_points = []
-        for height in range(SAMPLE_INTERVAL, min(max_height, block_count) + 1, SAMPLE_INTERVAL):
+        # For large datasets, sample less frequently (every 6000 blocks instead of 3000)
+        sample_interval = SAMPLE_INTERVAL * 2 if block_count > 1000000 else SAMPLE_INTERVAL
+        for height in range(sample_interval, min(max_height, block_count) + 1, sample_interval):
             sample_points.append(height)
         
         if not sample_points:
@@ -494,6 +574,15 @@ async def analyze_block_data(session, max_height=MAX_HEIGHT, use_cache=True):
                 "potential_revealed_values": []
             }
         
+        logger.info(f"Starting block data analysis with {len(sample_points)} sample points")
+        
+        # Setup progress tracking
+        progress = ProgressLogger(
+            total=len(sample_points),
+            description="Block Analysis Progress",
+            log_interval=3  # Log every 3 seconds
+        )
+        
         # Prepare result containers
         heights = []
         timestamps = []
@@ -504,22 +593,35 @@ async def analyze_block_data(session, max_height=MAX_HEIGHT, use_cache=True):
         
         # Process in smaller chunks to avoid memory issues
         chunk_size = 5  # Process 5 sample points at a time
-        for i in range(0, len(sample_points), chunk_size):
+        for chunk_index, i in enumerate(range(0, len(sample_points), chunk_size)):
             chunk_sample_points = sample_points[i:i+chunk_size]
+            logger.info(f"Processing chunk {chunk_index+1}/{(len(sample_points) + chunk_size - 1) // chunk_size}")
             
             # Get timestamps for each height - more efficient than getting all blocks
-            for height in chunk_sample_points:
+            for height_idx, height in enumerate(chunk_sample_points):
                 # Get the timestamp for this height
                 timestamp_query = select(Block.timestamp).order_by(Block.timestamp).limit(1).offset(height - 1)
                 timestamp_result = await session.execute(timestamp_query)
                 timestamp = timestamp_result.scalar()
                 
                 if not timestamp:
+                    progress.update()
                     continue
+                
+                # Show which height we're analyzing
+                logger.info(f"Analyzing height {height} (sample point {len(heights)+1})")
                 
                 # Get UTXOs up to this timestamp using our more efficient method
                 # Use a smaller limit for very large datasets
                 utxos = await get_utxos_at_timestamp(session, timestamp, limit=50000)
+                logger.info(f"Retrieved {len(utxos)} UTXOs for height {height}")
+                
+                # Create UTXO analysis progress logger
+                utxo_progress = ProgressLogger(
+                    total=len(utxos),
+                    description=f"UTXO Analysis at height {height}",
+                    log_interval=10  # Log every 10 seconds
+                )
                 
                 # Analyze UTXOs - using batch processing for better performance
                 total_value = 0
@@ -547,6 +649,12 @@ async def analyze_block_data(session, max_height=MAX_HEIGHT, use_cache=True):
                         # Check if this is P2SH with unknown script
                         elif addr_type == ADDR_P2SH:
                             p2sh_unknown_value += value
+                    
+                    # Update UTXO processing progress
+                    utxo_progress.update(len(batch))
+                
+                # Mark UTXO analysis as complete
+                utxo_progress.finish()
                 
                 # For revealed value estimation, use a more efficient approach
                 # Instead of checking each UTXO individually, use a statistical approach
@@ -565,8 +673,11 @@ async def analyze_block_data(session, max_height=MAX_HEIGHT, use_cache=True):
                 revealed_values.append(revealed_value * 1e-11)
                 potential_revealed_values.append((revealed_value + p2sh_unknown_value) * 1e-11)
                 
-                # Log progress for large datasets
-                logger.info(f"Processed height {height} ({len(heights)}/{len(sample_points)} sample points)")
+                # Update overall progress
+                progress.update()
+                
+        # Mark progress as complete
+        progress.finish()
         
         result = {
             "heights": heights,
@@ -579,6 +690,7 @@ async def analyze_block_data(session, max_height=MAX_HEIGHT, use_cache=True):
         
         # Cache the result
         cache_data(cache_key, result)
+        logger.info("Analysis complete - results cached")
         
         return result
     except SQLAlchemyError as e:
@@ -623,6 +735,8 @@ async def analyze_current_state(session, use_cache=True):
     try:
         # Get total UTXO value using a direct SQL query
         # Use a faster estimate query for very large datasets
+        logger.info("Starting current state analysis...")
+        logger.info("Calculating total UTXO value...")
         total_value_query = text("""
             SELECT SUM(o.value) 
             FROM tx_outputs o
@@ -630,10 +744,9 @@ async def analyze_current_state(session, use_cache=True):
             WHERE i.id IS NULL
         """)
         
-        logger.info("Calculating total UTXO value...")
         total_value_result = await session.execute(total_value_query)
         total_value = total_value_result.scalar() or 0
-        logger.info(f"Total UTXO value: {total_value * 1e-11} kBTC")
+        logger.info(f"Total UTXO value: {total_value * 1e-11:.2f} kBTC")
         
         # For very large datasets, use a more aggressive sampling approach
         # Increase sample size for more accuracy but not too large to cause memory issues
@@ -662,13 +775,17 @@ async def analyze_current_state(session, use_cache=True):
         p2sh_value = 0
         lost_value = 0
         
+        # Setup progress tracker
+        progress = ProgressLogger(
+            total=len(sampled_utxos),
+            description="UTXO Analysis Progress",
+            log_interval=3  # Log every 3 seconds
+        )
+        
         # Process the sample in smaller batches for better memory management
         batch_size = 500
         num_batches = (len(sampled_utxos) + batch_size - 1) // batch_size
         for batch_num, i in enumerate(range(0, len(sampled_utxos), batch_size)):
-            if batch_num % 10 == 0:
-                logger.info(f"Processing batch {batch_num+1}/{num_batches}...")
-                
             batch = sampled_utxos[i:i+batch_size]
             
             for txid, output_index, value, script_pub_key in batch:
@@ -700,11 +817,20 @@ async def analyze_current_state(session, use_cache=True):
                     # Count as lost value if we can't interpret the script
                     lost_value += value
                     logger.debug(f"Error interpreting script: {e}")
+                    
+                # Update progress for individual UTXO
+                progress.update(1)
+            
+            # Additional batch progress info
+            logger.info(f"Processed batch {batch_num+1}/{num_batches} ({i+len(batch)}/{len(sampled_utxos)} UTXOs)")
+        
+        # Mark progress as complete
+        progress.finish()
         
         # Scale values based on the ratio of actual total to sample total
         if sample_total_value > 0:
             scaling_factor = total_value / sample_total_value
-            logger.info(f"Using scaling factor: {scaling_factor}")
+            logger.info(f"Using scaling factor: {scaling_factor:.4f}")
             
             # Scale all values
             p2pk_value *= scaling_factor
@@ -726,6 +852,12 @@ async def analyze_current_state(session, use_cache=True):
             "p2sh_hidden": p2sh_value * 1e-11,
             "lost": lost_value * 1e-11
         }
+        
+        # Log the result summary
+        logger.info("===== Analysis Results =====")
+        for key, value in result.items():
+            logger.info(f"{key}: {value:.2f} kBTC")
+        logger.info("===========================")
         
         # Cache the result
         cache_data(cache_key, result)
