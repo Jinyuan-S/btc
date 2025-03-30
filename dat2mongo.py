@@ -1,7 +1,7 @@
 import base58
 import hashlib
 import itertools as itr
-import pymongo as db
+import pymysql as db
 from multiprocessing import Process, Value, Queue
 from blockchain_parser.blockchain import Block, get_blocks
 import time
@@ -15,6 +15,7 @@ MAX_FILE = 1234
 file_path = 'E:/Prof Marco FYP Blockchain/data/blocks/blk%05d.dat'
 NUM_UNPACKERS = 3  # 4 cores
 NUM_ANALYZERS = 8  # 12 cores (plus reader, hasher, etc.)
+QUEUE_SIZE_XLARGE = 100  # Size for large queues
 
 
 # flags for address types / 地址类型标志
@@ -359,10 +360,14 @@ def analysis_process_child(qin_child, qout_child, qchild_sync, qchild_write):
                 Dtotal += tout.value
 
                 if keyhash:
-                    # check if database entry with this address already exists, and update it if found / 检查具有此地址的数据库条目是否已经存在，如果找到则更新它
-                    cmd = {'$setOnInsert': {'type': tp, 'addr': addr},
-                            '$inc': {'val': tout.value, 'key-seen': int(pubkey != None)}}
-                    reqs.append( db.UpdateOne({'_id': keyhash}, cmd, upsert=True) )
+                    # MySQL equivalent of MongoDB's UpdateOne with upsert
+                    # Create a structure that represents the SQL operation to be performed
+                    cmd = {
+                        '_id': keyhash,
+                        '$setOnInsert': {'type': tp, 'addr': addr},
+                        '$inc': {'val': tout.value, 'key-seen': int(pubkey != None)}
+                    }
+                    reqs.append(cmd)
                 else:
                     Dlost += tout.value
             else:
@@ -381,17 +386,21 @@ def analysis_process_child(qin_child, qout_child, qchild_sync, qchild_write):
             if keyhash:
                 # try to extract public key from the unlocking script / 尝试从解锁脚本中提取公钥
                 (tp, pubkey) = interpret_unlock_script(tp, tin.script.hex)
-                # update database / 更新数据库
-                cmd = {'$set': {'type': tp}, '$inc': {'val': -val, 'key-seen': int(pubkey != None)}}
-                reqs.append( db.UpdateOne({'_id': keyhash}, cmd) )
+                # MySQL equivalent of MongoDB's UpdateOne
+                cmd = {
+                    '_id': keyhash,
+                    '$set': {'type': tp},
+                    '$inc': {'val': -val, 'key-seen': int(pubkey != None)}
+                }
+                reqs.append(cmd)
             else:
                 Dlost -= val
 
         # send requests to writer / 向编写器发送请求
         qchild_write.put(reqs)
         # tell our parent that we are done / 告诉我们的父母我们结束了
-        qchild_sync.put( (Dtotal, Dlost, Dopret, len(utxo_pool)) )   
-    
+        qchild_sync.put( (Dtotal, Dlost, Dopret, len(utxo_pool)) )
+
 
 # SYNC PROCESS / 同步过程
 # this process synchronizes after the analysis is done / 此过程在分析完成后进行同步
@@ -447,46 +456,135 @@ def writer_process(qchild_write_l, qsync_write):
     # number of blocks after which a snapshot is taken (must be a multiple of PRINT_STATUS and FLUSH_DATABASE) / 快照之后的块数（必须是PRINT_STATUS和FLUSH_DATABASE的倍数）
     TAKE_SNAPSHOT = 3000
  
-    # start mongod client / 启动mongod client
-    client = db.MongoClient()
-    lookup = client['btc']['addr']
-    # basic lookup table for bitcoin addresses / 比特币地址的基本查找表
-    #   "_id":      public key hash (address can be calculated from this) / 公钥散列（地址可以由此计算）
-    #   "type":     address type (P2PK, P2PKH, P2SH) - for initial transaction / 地址类型(P2PK, P2PKH, P2SH) -用于初始交易
-    #   "key-seen": number of times public key has been seen / 公钥被看到的次数
-    #   "val":      Satoshis at address / 中本聪在地址
-    #   "ins":      number of incoming transactions / 传入事务的数目
-    #   "outs":     number of outgoing transactions / 传出事务数
-    #   "height":   block height where address was last used / 地址最后被使用的块高度
-    snapshot = client['btc']['snap']
-    # snapshot of system state / 系统状态快照
+    # MySQL connection parameters
+    MYSQL_HOST = 'localhost'
+    MYSQL_PORT = 3306
+    MYSQL_USER = 'root'
+    MYSQL_PASSWORD = ''
+    MYSQL_DB = 'btc'
+    
+    # Connect to MySQL
+    connection = db.connect(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DB,
+        charset='utf8mb4'
+    )
+    cursor = connection.cursor()
+    
+    # Create tables if they don't exist
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS addr (
+        keyhash BIGINT PRIMARY KEY,
+        type INT,
+        addr VARCHAR(64),
+        val BIGINT,
+        key_seen INT DEFAULT 0,
+        ins INT DEFAULT 0,
+        outs INT DEFAULT 0,
+        height INT
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS snap (
+        height INT PRIMARY KEY,
+        date DATETIME,
+        tot_val BIGINT,
+        op_return BIGINT,
+        unknown BIGINT,
+        qattack_frac FLOAT,
+        unknown_frac FLOAT
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS summary_by_type (
+        height INT,
+        type VARCHAR(20),
+        num_pos INT,
+        tot_val BIGINT,
+        FOREIGN KEY (height) REFERENCES snap(height)
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS quantum_by_type (
+        height INT,
+        type VARCHAR(20),
+        num_pos INT,
+        tot_val BIGINT,
+        FOREIGN KEY (height) REFERENCES snap(height)
+    )
+    ''')
+    
+    connection.commit()
 
     def take_snapshot(date, total, lost, opret, height):        
-        snapshot.insert_one({'_id': height, 'date': date, 'tot-val': total, 'op-return': opret, 'unknown': lost })
+        # Insert snapshot data
+        cursor.execute(
+            "INSERT INTO snap (height, date, tot_val, op_return, unknown, qattack_frac, unknown_frac) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (height, date, total, opret, lost, 0.0, float(lost) / float(total) if total > 0 else 0.0)
+        )
+        connection.commit()
 
-        # use mongodb aggregate to calculate the numer of active (i.e. with positive balance) addresses and sum of balances for each type / 使用mongodb aggregate来计算每种类型的活跃（即具有正余额）地址的数量和余额之和
-        tpsummary = lookup.aggregate([
-                                      {'$match': {'val': {'$gt': 0}}},
-                                      {'$group': {'_id': '$type', 'num-pos': {'$sum': 1}, 'tot-val': {'$sum': '$val'}}}
-                                     ])
-        for doc in tpsummary:
-            # remove the '_id' item as this is not needed / 删除‘_id’项，因为不需要
-            doc['type'] = type2string(doc.pop('_id'))
-            snapshot.update_one({'_id': height}, {'$push': {'summary-by-type': doc}})
-
-        # now calculate the number and balance for active addresses where public key is known / 现在计算已知公钥的活动地址的数量和余额
-        qsummary = lookup.aggregate([
-                                     {'$match': {'key-seen': {'$gt': 0}, 'val': {'$gt': 0}}},
-                                     {'$group': {'_id': '$type', 'num-pos': {'$sum': 1}, 'tot-val': {'$sum': '$val'}}}
-                                    ])
+        # Calculate summary by type
+        cursor.execute('''
+        SELECT type, COUNT(*) as num_pos, SUM(val) as tot_val 
+        FROM addr 
+        WHERE val > 0 
+        GROUP BY type
+        ''')
+        
+        for row in cursor.fetchall():
+            type_int, num_pos, tot_val = row
+            type_str = type2string(type_int)
+            cursor.execute(
+                "INSERT INTO summary_by_type (height, type, num_pos, tot_val) VALUES (%s, %s, %s, %s)",
+                (height, type_str, num_pos, tot_val)
+            )
+        
+        # Calculate quantum vulnerable addresses
+        cursor.execute('''
+        SELECT type, COUNT(*) as num_pos, SUM(val) as tot_val 
+        FROM addr 
+        WHERE key_seen > 0 AND val > 0 
+        GROUP BY type
+        ''')
+        
         qval = 0
-        for doc in qsummary:
-            # remove the '_id' item as this is not needed / 删除‘_id’项，因为不需要
-            doc['type'] = type2string(doc.pop('_id'))
-            qval += doc['tot-val']
-            snapshot.update_one({'_id': height}, {'$push': {'quantum-by-type': doc}})
-        # update the total quantum vulnerable Satoshis / 更新总量子脆弱的中本聪
-        snapshot.update_one({'_id': height}, {'$set': {'qattack-frac': float(qval) / float(total), 'unknown-frac': float(lost) / float(total) }})
+        for row in cursor.fetchall():
+            type_int, num_pos, tot_val = row
+            type_str = type2string(type_int)
+            qval += tot_val
+            cursor.execute(
+                "INSERT INTO quantum_by_type (height, type, num_pos, tot_val) VALUES (%s, %s, %s, %s)",
+                (height, type_str, num_pos, tot_val)
+            )
+        
+        # Update quantum attack vulnerability
+        cursor.execute(
+            "UPDATE snap SET qattack_frac = %s WHERE height = %s",
+            (float(qval) / float(total) if total > 0 else 0.0, height)
+        )
+        connection.commit()
+
+    # SQL statements for database operations
+    insert_addr_sql = '''
+    INSERT INTO addr (keyhash, type, addr, val, key_seen)
+    VALUES (%s, %s, %s, %s, %s)
+    ON DUPLICATE KEY UPDATE
+    val = val + VALUES(val),
+    key_seen = key_seen + VALUES(key_seen)
+    '''
+    
+    update_addr_sql = '''
+    UPDATE addr
+    SET type = %s, val = val + %s, key_seen = key_seen + %s
+    WHERE keyhash = %s
+    '''
 
     reqs = []
     while True:
@@ -494,9 +592,38 @@ def writer_process(qchild_write_l, qsync_write):
         if not qsync_write.get():
             # we are done / 我们做完了
             if reqs: 
-                lookup.bulk_write(reqs, ordered=True, bypass_document_validation=True)
+                # Execute any remaining requests
+                for req in reqs:
+                    if req.get('$setOnInsert', None):
+                        # This is an insert or update operation
+                        keyhash = req['_id']
+                        data = req['$setOnInsert']
+                        inc_data = req.get('$inc', {})
+                        
+                        cursor.execute(insert_addr_sql, 
+                            (keyhash, 
+                             data.get('type', None), 
+                             data.get('addr', None), 
+                             inc_data.get('val', 0),
+                             inc_data.get('key-seen', 0))
+                        )
+                    elif req.get('$set', None) or req.get('$inc', None):
+                        # This is an update operation
+                        keyhash = req['_id']
+                        set_data = req.get('$set', {})
+                        inc_data = req.get('$inc', {})
+                        
+                        cursor.execute(update_addr_sql,
+                            (set_data.get('type', None),
+                             inc_data.get('val', 0),
+                             inc_data.get('key-seen', 0),
+                             keyhash)
+                        )
+                connection.commit()
             take_snapshot(date, total, lost, opret, height)
             print('final database update (snapshot taken)')  # 最后的数据库更新（快照）
+            cursor.close()
+            connection.close()
             return
         # get status / 获得地位
         (date, total, lost, opret, height) = qsync_write.get()
@@ -508,8 +635,34 @@ def writer_process(qchild_write_l, qsync_write):
             reqs.extend(qchild.get())
 
         if ((height % TAKE_SNAPSHOT == 0) and reqs) or ((height % FLUSH_DATABASE == 0) and (len(reqs) > MIN_FLUSH)):
-            # bulk write to database (will halt process until completed) / 批量写入数据库（将暂停进程，直到完成）
-            lookup.bulk_write(reqs, ordered=True, bypass_document_validation=True)
+            # Execute batch of requests
+            for req in reqs:
+                if req.get('$setOnInsert', None):
+                    # This is an insert or update operation
+                    keyhash = req['_id']
+                    data = req['$setOnInsert']
+                    inc_data = req.get('$inc', {})
+                    
+                    cursor.execute(insert_addr_sql, 
+                        (keyhash, 
+                         data.get('type', None), 
+                         data.get('addr', None), 
+                         inc_data.get('val', 0),
+                         inc_data.get('key-seen', 0))
+                    )
+                elif req.get('$set', None) or req.get('$inc', None):
+                    # This is an update operation
+                    keyhash = req['_id']
+                    set_data = req.get('$set', {})
+                    inc_data = req.get('$inc', {})
+                    
+                    cursor.execute(update_addr_sql,
+                        (set_data.get('type', None),
+                         inc_data.get('val', 0),
+                         inc_data.get('key-seen', 0),
+                         keyhash)
+                    )
+            connection.commit()
             reqs = []
 
         if height % PRINT_STATUS == 0:
