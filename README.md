@@ -69,6 +69,8 @@ interface AddressSummaryResponse {
 ### a. show variables like "%_buffer%";
 ### b. SET GLOBAL innodb_buffer_pool_size=67108864;   // 可以改为更大的值，这个是3x1024x1024x1024的大小
 
+## 7. 单个地址查询
+`GET /api/address/1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa`
 
 
 # NEW Data Structure

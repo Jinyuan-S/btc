@@ -3,9 +3,9 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import select, and_
 from app.config import settings
-from app.models import Snapshot, SnapshotSummaryByType, SnapshotQuantumByType
+from app.models import Snapshot, SnapshotSummaryByType, SnapshotQuantumByType, Address
 from contextlib import asynccontextmanager
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field
 import logging
 import uvicorn
@@ -23,24 +23,35 @@ try:
     # 创建异步引擎，设置连接池
     engine = create_async_engine(
         settings.MYSQL_URL,
-    echo=True,  # 设置为True可以看到SQL语句
-    pool_size=5,  # 连接池大小
-    max_overflow=10,  # 超过pool_size后最多可以创建的连接数
-    pool_timeout=30,  # 连接池获取连接的超时时间
+        echo=True,  # 设置为True可以看到SQL语句
+        pool_size=5,  # 连接池大小
+        max_overflow=10,  # 超过pool_size后最多可以创建的连接数
+        pool_timeout=30,  # 连接池获取连接的超时时间
         pool_recycle=1800,  # 连接在连接池中重用的时间，超过后会被回收
+        pool_pre_ping=True,  # 在使用连接前检查连接是否有效
+        connect_args={
+            "connect_timeout": 10,  # 连接超时时间
+            "charset": "utf8mb4",
+            "use_unicode": True,
+            "autocommit": False
+        }
     )
 except Exception as e:
     logger.error(f"Failed to create engine: {e}")
+    raise  # Re-raise the exception to prevent the app from starting with a broken database connection
 
 try:
     # 创建异步会话工厂
     async_session = sessionmaker(
         engine,
         class_=AsyncSession,
-        expire_on_commit=False
+        expire_on_commit=False,
+        autocommit=False,
+        autoflush=False
     )
 except Exception as e:
     logger.error(f"Failed to create sessionmaker: {e}")
+    raise  # Re-raise the exception to prevent the app from starting with a broken session factory
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -311,6 +322,123 @@ async def get_address_summary_image():
         return Response(content=buf.getvalue(), media_type="image/png")
     except Exception as e:
         logger.error(f"Error in /api/address-summary: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+class AddressInfoResponse(BaseModel):
+    """
+    比特币地址信息响应模型
+    """
+    address: str = Field(
+        description="比特币地址",
+        example="1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+    )
+    address_type: str = Field(
+        description="地址类型 (P2PK, P2PK_comp, P2PKH, P2SH等)",
+        example="P2PKH"
+    )
+    balance: int = Field(
+        description="当前余额（单位：satoshi）",
+        example=50000000
+    )
+    key_seen: int = Field(
+        description="公钥暴露次数",
+        example=1
+    )
+    ins_count: int = Field(
+        description="接收交易次数",
+        example=10
+    )
+    outs_count: int = Field(
+        description="发送交易次数",
+        example=5
+    )
+    last_height: Optional[int] = Field(
+        description="最后使用的区块高度",
+        example=700000,
+        default=None
+    )
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "address": "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+                "address_type": "P2PKH",
+                "balance": 50000000,
+                "key_seen": 1,
+                "ins_count": 10,
+                "outs_count": 5,
+                "last_height": 700000
+            }
+        }
+
+def get_address_type(type_int: int) -> str:
+    """Convert address type integer to string representation"""
+    type_map = {
+        1: "P2PK",
+        2: "P2PK_comp",
+        10: "P2PKH",
+        20: "P2SH"
+    }
+    return type_map.get(type_int, "unknown")
+
+@app.get(
+    "/api/address/{address}",
+    summary="获取指定比特币地址的详细信息",
+    response_model=AddressInfoResponse,
+    response_description="返回地址的详细信息，包括余额、交易历史等"
+)
+async def get_address_info(address: str):
+    """
+    获取指定比特币地址的详细信息，包括：
+    * 地址类型
+    * 当前余额
+    * 公钥暴露次数
+    * 交易次数统计
+    * 最后使用的区块高度
+    """
+    try:
+        async with async_session() as session:
+            # Add debug logging
+            logger.info(f"Searching for address: {address}")
+            
+            # Add timeout and limit to the query
+            query = select(Address).where(
+                (Address.addr == address) | (Address.keyhash == address)
+            ).limit(1)  # Limit to 1 result
+            
+            try:
+                # Add timeout to the execute call
+                result = await session.execute(query)
+                address_info = result.scalar_one_or_none()
+            except Exception as db_error:
+                logger.error(f"Database query error: {db_error}", exc_info=True)
+                raise HTTPException(
+                    status_code=500,
+                    detail="Database query timeout or error"
+                )
+
+            if not address_info:
+                logger.warning(f"Address not found: {address}")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Address {address} not found"
+                )
+
+            logger.info(f"Found address info: {address_info.addr}, type: {address_info.type}, balance: {address_info.val}")
+
+            return AddressInfoResponse(
+                address=address_info.addr or address_info.keyhash,  # Use keyhash if addr is None
+                address_type=get_address_type(address_info.type),
+                balance=address_info.val or 0,  # Handle None values
+                key_seen=address_info.key_seen or 0,
+                ins_count=address_info.ins_count or 0,
+                outs_count=address_info.outs_count or 0,
+                last_height=address_info.last_height  # Now accepts None
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/address/{address}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
