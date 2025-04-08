@@ -74,7 +74,7 @@ interface AddressSummaryResponse {
 
 ## 8. 项目保留之前的旧数据结构，后端使用 btc_4 数据库即可，此数据库包含 server 的所有数据，且脚本 dat2mongo.py 和 mongo2MySQL.py 全部设计了动态更新和断点续存的机制，后续如果有新的数据，可以从断点处继续写入
 
-## 9. btc_front_end 为前端代码
+## 9. bitcoin_front_end 为前端代码
 
 # NEW Data Structure
 
