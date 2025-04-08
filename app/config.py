@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     MYSQL_PASSWORD: str = "gsj123"
     MYSQL_HOST: str = "localhost"
     MYSQL_PORT: int = 3306
-    MYSQL_DB: str = "btc"
+    MYSQL_DB: str = "btc_3"
     
     @property
     def MYSQL_URL(self) -> str:

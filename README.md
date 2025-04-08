@@ -39,7 +39,7 @@ url: `http://localhost:8000/api/address-summary` 绘制address summary表
 method: `GET`
 description: 获取最新区块的比特币地址类型分布摘要，包括不同类型地址持有的比特币数量及其安全性分类。
 
-response type: 
+response type:
 ```typescript
 interface AddressSummaryResponse {
     p2pk_total: number;                    // P2PK地址总量（包括multisig和compressed）
@@ -72,6 +72,9 @@ interface AddressSummaryResponse {
 ## 7. 单个地址查询
 `GET /api/address/1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa`
 
+## 8. 项目保留之前的旧数据结构，后端使用 btc_4 数据库即可，此数据库包含 server 的所有数据，且脚本 dat2mongo.py 和 mongo2MySQL.py 全部设计了动态更新和断点续存的机制，后续如果有新的数据，可以从断点处继续写入
+
+## 9. btc_front_end 为前端代码
 
 # NEW Data Structure
 
