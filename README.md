@@ -2,18 +2,19 @@
 
 A comprehensive Bitcoin blockchain data analysis system that provides insights on address types, quantum vulnerability, and distribution patterns across the blockchain.
 
-## Setup
 
-Before running, create a `.env` file in the project root with your database configuration:
-
-```
-# MySQL Configuration
-MYSQL_USER=
-MYSQL_PASSWORD=
-MYSQL_HOST=
-MYSQL_PORT=
-MYSQL_DB=
-```
+## Guidelines for Starting the Project
+1. If you are running this project on another computer, make sure that all required dependencies and software are installed and configured. (Python3.8.10, NodeJS v22.14.0, VS Code/IntelliJ Idea, Navicat Premium 17, MySQL8.0(and create the four tables listed below), MongoDB Compass, etc.)
+2. Download the latest .dat block file to the specified directory on this server. Directory: `E:\Prof Marco FYP Blockchain\data\blocks` 
+(PS: The last block file in the directory is blk03480.dat. Please make sure that the next file to download is blk03481.dat. The files in the directory must be consecutive and there can be no duplicates.)
+3. Once the block data file has been downloaded to the directory, launch the dat2mongo.py script. The script will continue to write data to MongoDB, depending on where it left off, until it gets to the last file in the directory. 
+(PS: You can also interrupt the program when prompted to do so.)
+4. When the preceding program shows that all blocks have been written to MongoDB, you can launch the mongo2MySQL.py script. This will import all the data from MongoDB into MySQL.
+(PS: The script also supports progress reads.)
+5. Once you've finished running the scripts, you can run analyzed.py to generate the graphs that for this project.
+6. Open the terminal with administrator privileges in the project root and type `python -m app.main` to start the backend.
+7. If the backend was started successfully, open a new terminal with administrator privileges and enter `npm run dev` in the `/bitcoin_front_end` directory. Once the frontend has started successfully, the console will print the web address of the frontend, for example: http://localhost:5173/
+8. At this point, the project has been successfully deployed to the server. If you want to access the project elsewhere, you first need to link to NUS VPN and then type the web address (Format: http://ServerIP:5173/, for example, http://10.248.8.247:5173/) into your browser to access it.
 
 ## API Documentation
 
@@ -64,107 +65,57 @@ interface AddressSummaryResponse {
 **Method**: `GET`  
 **Example**: `GET /api/address/1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa`
 
-## Data Processing
-
-The project includes a `dat2mysql.py` script that imports Bitcoin blockchain data (.dat files) into MySQL. The optimized implementation:
-
-- Uses multi-threading (default 4 threads) to analyze .dat files into temporary CSV files
-- Employs transaction batching for efficient database insertion
-- Processes a complete .dat file in approximately 20 minutes
-- Supports interruption and resumption via checkpoints
-- Automatically cleans up temporary CSV files after successful imports
-
-### Running the Import Script
-
-1. Configure MySQL to allow local file imports:
-   - Add `local_infile=1` to the `[mysqld]` section in your MySQL configuration file (e.g., my.ini on Windows)
-   - Restart the MySQL service
-
-2. If you encounter lock table size errors, increase the InnoDB buffer pool size:
-   ```sql
-   SET GLOBAL innodb_buffer_pool_size=67108864; -- Can be set to a larger value as needed
-   ```
-
-3. To restart the import process, clear existing tables:
-   ```sql
-   USE btc_analysis;
-   SET FOREIGN_KEY_CHECKS = 0;
-   TRUNCATE TABLE address;
-   TRUNCATE TABLE tx_inputs;
-   TRUNCATE TABLE tx_outputs;
-   TRUNCATE TABLE transactions;
-   TRUNCATE TABLE blocks;
-   SET FOREIGN_KEY_CHECKS = 1;
-   ```
-   Also clear the contents of `checkpoint.json` to start from the beginning.
 
 ## Database Structure
 
 ### Current Schema
 
 ```sql
-CREATE TABLE `address` (
-  `address` varchar(50) NOT NULL,
-  `address_type` varchar(20) NOT NULL,
-  `total_received` bigint NOT NULL DEFAULT 0,
-  `total_sent` bigint NOT NULL DEFAULT 0,
-  `balance` bigint NOT NULL DEFAULT 0,
-  `pubkey_revealed` tinyint(1) NOT NULL DEFAULT 0,
-  `first_seen_block` char(64) DEFAULT NULL,
-  `last_seen_block` char(64) DEFAULT NULL,
-  PRIMARY KEY (`address`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=DYNAMIC;
+DROP TABLE IF EXISTS `addresses`;
+CREATE TABLE `addresses`  (
+    `id` int NOT NULL AUTO_INCREMENT,
+    `keyhash` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+    `addr` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL,
+    `type` tinyint NULL DEFAULT NULL,
+    `val` bigint NULL DEFAULT NULL,
+    `key_seen` int NULL DEFAULT 0,
+    `ins_count` int NULL DEFAULT 0,
+    `outs_count` int NULL DEFAULT 0,
+    `last_height` int NULL DEFAULT NULL,
+    PRIMARY KEY (`id`) USING BTREE,
+    UNIQUE INDEX `keyhash`(`keyhash` ASC) USING BTREE
+) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
 
-CREATE TABLE `blocks` (
-  `block_hash` char(64) NOT NULL,
-  `version` int NOT NULL,
-  `prev_block_hash` char(64) NOT NULL,
-  `merkle_root` char(64) NOT NULL,
-  `timestamp` int NOT NULL,
-  `bits` int NOT NULL,
-  `nonce` int NOT NULL,
-  `block_size` int NOT NULL,
-  `tx_count` int NOT NULL,
-  `raw_block` longblob NOT NULL,
-  `file_name` varchar(50) DEFAULT NULL,
-  `file_offset` bigint DEFAULT NULL,
-  PRIMARY KEY (`block_hash`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=DYNAMIC;
+DROP TABLE IF EXISTS `snapshots`;
+CREATE TABLE `snapshots`  (
+                              `height` int NOT NULL,
+                              `snap_date` datetime NULL DEFAULT NULL,
+                              `tot_val` bigint NULL DEFAULT NULL,
+                              `op_return` bigint NULL DEFAULT NULL,
+                              `unknown` bigint NULL DEFAULT NULL,
+                              `qattack_frac` double NULL DEFAULT NULL,
+                              `unknown_frac` double NULL DEFAULT NULL,
+                              PRIMARY KEY (`height`) USING BTREE
+) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
 
-CREATE TABLE `transactions` (
-  `txid` char(64) NOT NULL,
-  `block_hash` char(64) NOT NULL,
-  `version` int NOT NULL,
-  `input_count` int NOT NULL,
-  `output_count` int NOT NULL,
-  `lock_time` int NOT NULL,
-  `raw_tx` longblob NOT NULL,
-  PRIMARY KEY (`txid`),
-  KEY `idx_block_hash` (`block_hash`),
-  CONSTRAINT `fk_tx_block` FOREIGN KEY (`block_hash`) REFERENCES `blocks` (`block_hash`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=DYNAMIC;
+DROP TABLE IF EXISTS `snapshot_quantum_by_type`;
+CREATE TABLE `snapshot_quantum_by_type`  (
+    `snap_height` int NOT NULL,
+    `addr_type` varchar(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+    `num_pos` int NULL DEFAULT NULL,
+    `tot_val` bigint NULL DEFAULT NULL,
+    PRIMARY KEY (`snap_height`, `addr_type`) USING BTREE,
+    CONSTRAINT `fk_snapheight2` FOREIGN KEY (`snap_height`) REFERENCES `snapshots` (`height`) ON DELETE CASCADE ON UPDATE RESTRICT
+) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
 
-CREATE TABLE `tx_inputs` (
-  `id` bigint NOT NULL AUTO_INCREMENT,
-  `txid` char(64) NOT NULL,
-  `input_index` int NOT NULL,
-  `prev_txid` char(64) NOT NULL,
-  `prev_output_index` int NOT NULL,
-  `script_sig` longblob NOT NULL,
-  `sequence` bigint NOT NULL,
-  PRIMARY KEY (`id`),
-  KEY `idx_txid` (`txid`),
-  CONSTRAINT `fk_input_tx` FOREIGN KEY (`txid`) REFERENCES `transactions` (`txid`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=DYNAMIC;
+DROP TABLE IF EXISTS `snapshot_summary_by_type`;
+CREATE TABLE `snapshot_summary_by_type`  (
+    `snap_height` int NOT NULL,
+    `addr_type` varchar(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+    `num_pos` int NULL DEFAULT NULL,
+    `tot_val` bigint NULL DEFAULT NULL,
+    PRIMARY KEY (`snap_height`, `addr_type`) USING BTREE,
+    CONSTRAINT `fk_snapheight` FOREIGN KEY (`snap_height`) REFERENCES `snapshots` (`height`) ON DELETE CASCADE ON UPDATE RESTRICT
+) ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = Dynamic;
 
-CREATE TABLE `tx_outputs` (
-  `id` bigint NOT NULL AUTO_INCREMENT,
-  `txid` char(64) NOT NULL,
-  `output_index` int NOT NULL,
-  `value` bigint NOT NULL,
-  `script_pub_key` longblob NOT NULL,
-  PRIMARY KEY (`id`),
-  KEY `idx_txid` (`txid`),
-  CONSTRAINT `fk_output_tx` FOREIGN KEY (`txid`) REFERENCES `transactions` (`txid`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8 ROW_FORMAT=DYNAMIC;
 ```
