@@ -3,29 +3,29 @@ import pymysql
 import math
 import os
 
-# ========== 配置部分 ==========
+# ========== 配置部分 / The Configuration section ==========
 MONGO_URI = "mongodb://localhost:27017"
-MONGO_DB  = "btc"           # MongoDB数据库
-ADDR_COLL = "addr"          # btc.addr 集合
-SNAP_COLL = "snap"          # btc.snap 集合
+MONGO_DB  = "btc"           # MongoDB数据库 / MongoDB database
+ADDR_COLL = "addr"          # btc.addr 集合 / btc.addr collection
+SNAP_COLL = "snap"          # btc.snap 集合 / btc.snap collection
 
 MYSQL_HOST     = "127.0.0.1"
 MYSQL_PORT     = 3306
 MYSQL_USER     = "root"
 MYSQL_PASSWORD = "btcbtc"
-MYSQL_DB       = "btc_3"   # 你在MySQL中创建的数据库
+MYSQL_DB       = "btc_5"   # 你在MySQL中创建的数据库 / The database you created in MySQL
 
-# 批量提交的大小
+# 批量提交的大小 / The size of the batch submission
 BATCH_SIZE = 2000
 
-# 进度文件名
+# 进度文件名 / Progress file name
 PROGRESS_ADDR_FILE = "progress_addr.txt"
 PROGRESS_SNAP_FILE = "progress_snap.txt"
 
-# ========== 辅助函数：读取 / 保存进度 ==========
+# ========== 辅助函数：读取 / 保存进度 / Helper functions: read/save progress ==========
 
 def load_progress(filename):
-    """从本地文件读取已处理文档数量，若无则返回0"""
+    """从本地文件读取已处理文档数量，若无则返回0 / Reads the number of processed documents from the local file.If none is present, 0 is returned"""
     if not os.path.exists(filename):
         return 0
     with open(filename, 'r', encoding='utf-8') as f:
@@ -35,18 +35,18 @@ def load_progress(filename):
         return 0
 
 def save_progress(filename, count):
-    """把已处理文档数写入本地文件"""
+    """把已处理文档数写入本地文件 / Writes the number of processed documents to the local file"""
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(str(count))
 
-# ========== 连接MongoDB ==========
+# ========== 连接MongoDB / Connect to MongoDB ==========
 mongo_client = pymongo.MongoClient(MONGO_URI)
 mdb = mongo_client[MONGO_DB]
 
 coll_addr = mdb[ADDR_COLL]
 coll_snap = mdb[SNAP_COLL]
 
-# ========== 连接MySQL ==========
+# ========== 连接MySQL / Connecting to MySQL ==========
 conn = pymysql.connect(
     host=MYSQL_HOST,
     port=MYSQL_PORT,
@@ -58,21 +58,21 @@ conn = pymysql.connect(
 cursor = conn.cursor()
 
 # =====================================
-# 1. 导入 addresses
+# 1. 导入 addresses / Importing addresses
 # =====================================
 print(">>> Importing addresses ...")
 
-# 获取文档总数（若数量极大，也可以用 estimated_document_count()）
+# 获取文档总数（若数量极大，也可以用 estimated_document_count()） / Get the total number of documents (or estimated_document_count() if the number is very large)
 addr_count_total = coll_addr.count_documents({})
 print(f"Total addresses to process: {addr_count_total}")
 
-# 读取上次的进度(已经处理多少条)
+# 读取上次的进度(已经处理多少条) / Read the last progress (how many items have been processed)
 progress_addr = load_progress(PROGRESS_ADDR_FILE)
 print(f"Resuming from addresses skip={progress_addr} ...")
 
-# 用skip跳过已经处理的文档
+# 用skip跳过已经处理的文档 / Use skip to skip already processed documents
 addr_cursor = coll_addr.find({}).skip(progress_addr)
-count_addr = progress_addr  # 表示我们已经跳过了这部分
+count_addr = progress_addr  # 表示我们已经跳过了这部分 / Indicates that we've skipped this part
 
 batch_data = []
 
@@ -90,7 +90,7 @@ ON DUPLICATE KEY UPDATE
 """
 
 for doc in addr_cursor:
-    # 提取字段
+    # 提取字段 / Extracting fields
     keyhash     = str(doc['_id'])
     addr_str    = doc.get('addr', None)
     type_int    = doc.get('type', -1)
@@ -107,32 +107,32 @@ for doc in addr_cursor:
     batch_data.append(row)
     count_addr += 1
 
-    # 如果达到了批大小，执行一次批量插入
+    # 如果达到了批大小，执行一次批量插入 / If the batch size is reached, perform a batch insert
     if len(batch_data) >= BATCH_SIZE:
         cursor.executemany(sql_addr, batch_data)
         conn.commit()
         batch_data.clear()
 
-        # 保存进度
+        # 保存进度 / Saving progress
         save_progress(PROGRESS_ADDR_FILE, count_addr)
 
-        # 打印进度
+        # 打印进度 / Print progress
         progress_percent = count_addr / addr_count_total * 100 if addr_count_total else 0
         print(f"Processed {count_addr} / {addr_count_total} ({progress_percent:.2f}%) addresses", flush=True)
 
-# 处理剩余不满一批的数据
+# 处理剩余不满一批的数据 / Processing data that is not part of a batch
 if batch_data:
     cursor.executemany(sql_addr, batch_data)
     conn.commit()
     batch_data.clear()
-    # 保存进度
+    # 保存进度 / Saving progress
     save_progress(PROGRESS_ADDR_FILE, count_addr)
 
 print(f"Done addresses: {count_addr} rows inserted/updated.\n")
 
 
 # =====================================
-# 2. 导入快照 snapshots
+# 2. 导入快照 snapshots / Importing snapshots
 # =====================================
 print(">>> Importing snapshots ...")
 
@@ -173,14 +173,14 @@ ON DUPLICATE KEY UPDATE
   tot_val=VALUES(tot_val)
 """
 
-# 读取 snapshots 的进度
+# 读取 snapshots 的进度 / Read the progress of the snapshots
 progress_snap = load_progress(PROGRESS_SNAP_FILE)
 print(f"Resuming from snapshots skip={progress_snap} ...")
 
 snap_cursor = coll_snap.find({}).skip(progress_snap)
 count_snap = progress_snap
 
-batch_size_snap = 1000  # 你也可以用同一个BATCH_SIZE
+batch_size_snap = 1000  # 你也可以用同一个BATCH_SIZE / You can also use the same BATCH_SIZE
 commit_counter = 0
 
 for doc in snap_cursor:
@@ -192,7 +192,7 @@ for doc in snap_cursor:
     qattack   = doc.get('qattack-frac', 0.0)
     un_frac   = doc.get('unknown-frac', 0.0)
 
-    # 插入 snapshots
+    # 插入 snapshots / Inserting snapshots
     cursor.execute(snap_sql, (height, snap_date, tot_val, op_return, unknown, qattack, un_frac))
 
     # summary-by-type
@@ -214,7 +214,7 @@ for doc in snap_cursor:
     count_snap += 1
     commit_counter += 1
 
-    # 每过一定数量commit一次，并保存进度
+    # 每过一定数量commit一次，并保存进度 / Make a commit every certain number of times and save the progress
     if commit_counter >= batch_size_snap:
         conn.commit()
         save_progress(PROGRESS_SNAP_FILE, count_snap)
@@ -224,7 +224,7 @@ for doc in snap_cursor:
 
         commit_counter = 0
 
-# 提交剩余
+# 提交剩余 / Commit surplus
 conn.commit()
 save_progress(PROGRESS_SNAP_FILE, count_snap)
 
