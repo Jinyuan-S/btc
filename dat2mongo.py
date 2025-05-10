@@ -12,10 +12,10 @@ import glob
 import threading
 import sys
 
-# 定义创世区块前置哈希（全零字符串）
+# 定义创世区块前置哈希（全零字符串） / Define Genesis block prefix hash (all-zero string)
 GENESIS_HASH = "0000000000000000000000000000000000000000000000000000000000000000"
 
-# checkpoint 相关函数，保存格式为 "file_index,last_hash,block_height,utxo_size"
+# checkpoint 相关函数，保存格式为 "file_index,last_hash,block_height,utxo_size" / checkpoint related functions, saved as "file_index,last_hash,block_height,utxo_size"
 def read_checkpoint():
     try:
         with open("checkpoint.txt", "r") as f:
@@ -31,7 +31,7 @@ def update_checkpoint(file_index, curr_hash, block_height, utxo_size):
     with open("checkpoint.txt", "w") as f:
         f.write(f"{file_index},{curr_hash},{block_height},{utxo_size}")
 
-# 改进版超时输入函数：在 Windows 下使用 msvcrt 模块检测键盘输入，其他平台采用线程方式
+# 改进版超时输入函数：在 Windows 下使用 msvcrt 模块检测键盘输入，其他平台采用线程方式 / Improved version of timeout input function: use msvcrt module to detect keyboard input in Windows, other platforms use thread mode
 def get_input_timeout(prompt, timeout):
     if os.name == 'nt':
         import msvcrt
@@ -70,7 +70,7 @@ def get_input_timeout(prompt, timeout):
             return None
         return result[0]
 
-# 动态统计数据目录下所有 .dat 文件数量
+# 动态统计数据目录下所有 .dat 文件数量 / The number of.dat files in the dynamic statistics directory
 file_dir = "E:/Prof Marco FYP Blockchain/data/blocks"
 file_pattern = os.path.join(file_dir, "blk*.dat")
 files = glob.glob(file_pattern)
@@ -78,13 +78,13 @@ files.sort()
 MAX_FILE = len(files)
 file_path = os.path.join(file_dir, "blk%05d.dat")
 
-# 读取 checkpoint，如果 checkpoint 中 file_index 大于等于 MAX_FILE 则退出
+# 读取 checkpoint，如果 checkpoint 中 file_index 大于等于 MAX_FILE 则退出 / Read the checkpoint and exit if file_index in the checkpoint is greater than or equal to MAX_FILE
 file_index, last_hash, saved_height, saved_utxo = read_checkpoint()
 if file_index >= MAX_FILE:
-    print("没有新的.dat文件需要处理。当前checkpoint:", file_index, "文件总数:", MAX_FILE)
+    print("There are no new .dat files to process. Current checkpoint: ", file_index, ". Total files:", MAX_FILE)
     sys.exit(0)
 
-# 地址类型常量
+# 地址类型常量 / Address type constant
 ADDR_UNKNOWN        = int(-1)
 ADDR_P2PK           = int(1)      # pay to public key
 ADDR_P2PK_comp      = int(2)      # pay to compressed public key
@@ -122,12 +122,12 @@ def keyhash2address(keyhash):
     checksum = hashlib.sha256(hashlib.sha256(b'\x00' + keyhash).digest()).digest()
     return base58.b58encode(b'\x00' + keyhash + checksum[:4])
 
-# 计算 utxo 哈希，保持原有逻辑
+# 计算 utxo 哈希，保持原有逻辑 / Compute the utxo hash and keep the original logic
 def calcutxohash(itx, txhash):
     hash_val = int.from_bytes(txhash[:8], byteorder='big', signed=False)
     return (hash_val >> 1) ^ itx
 
-# 解释锁定脚本，注意 P2SH 分支调用内部的 calcshorthash
+# 解释锁定脚本，注意 P2SH 分支调用内部的 calcshorthash / Interpret the lock script and notice the calcshorthash inside the P2SH branch call
 def interpret_lock_script(lock):
     def calcshorthash(keyhash):
         return int.from_bytes(keyhash[:8], byteorder='big', signed=False) >> 1
@@ -202,10 +202,10 @@ def interpret_unlock_script(tp, unlock):
     else:
         return (tp, None)
 
-# 修改后的 READER PROCESS
-# 参数 start_hash 用于恢复上次运行时的链末尾，另外传入共享变量 h 与 utxolen 以便在用户选择停止时更新 checkpoint
+# 修改后的 READER PROCESS / Modified READER PROCESS
+# 参数 start_hash 用于恢复上次运行时的链末尾，另外传入共享变量 h 与 utxolen 以便在用户选择停止时更新 checkpoint / The start_hash parameter is used to restore the end of the chain from the last run, and the shared variables h and utxolen are passed to update the checkpoint when the user chooses to stop
 def reader_process(qread_unpack_l, qread_sync, f, b, fmax, start_hash, h, utxolen):
-    curr_hash = start_hash  # 从 checkpoint 恢复当前链尾
+    curr_hash = start_hash  # 从 checkpoint 恢复当前链尾 / Restores the current chain tail from the checkpoint
     blk_pool = {}
     if f.value < fmax:
         rdr = iter(get_blocks(file_path % f.value))
@@ -229,7 +229,7 @@ def reader_process(qread_unpack_l, qread_sync, f, b, fmax, start_hash, h, utxole
                 blk_pool[blk.header.previous_block_hash] = blk
                 b.value += 1
             except StopIteration:
-                # 文件处理完毕，先更新 checkpoint——若用户选择停止，则不推进文件编号
+                # 文件处理完毕，先更新 checkpoint——若用户选择停止，则不推进文件编号 / When the file is processed, the checkpoint is updated first - if the user chooses to stop, the file number is not advanced
                 user_input = get_input_timeout("继续处理下一个文件? (Y/n): ", 10)
                 if user_input is None or user_input.strip() == "" or user_input.strip().lower() == "y":
                     if f.value < fmax:
@@ -242,7 +242,7 @@ def reader_process(qread_unpack_l, qread_sync, f, b, fmax, start_hash, h, utxole
                         qread_sync.put(None)
                         return
                 else:
-                    # 用户选择停止，则保持当前文件编号（即 f.value-1），并保存当前 h 与 utxolen
+                    # 用户选择停止，则保持当前文件编号（即 f.value-1），并保存当前 h 与 utxolen / If the user chooses to stop, the current file number (that is, f.vale-1) is kept and the current h and utxolen are saved
                     update_checkpoint(f.value - 1, curr_hash, h.value, utxolen.value)
                     for q in qread_unpack_l:
                         q.put(None)
@@ -421,7 +421,7 @@ def writer_process(qchild_write_l, qsync_write):
 
 if __name__ == '__main__':
     freeze_support()
-    # 读取 checkpoint后初始化共享变量（文件号、区块高度、utxo 数量）
+    # 读取 checkpoint后初始化共享变量（文件号、区块高度、utxo 数量） / Initialize shared variables (file number, block height, number of UTXOs) after reading checkpoint
     file_index, last_hash, saved_height, saved_utxo = read_checkpoint()
     qread_unpack_l = [Queue(12) for i in range(3)]
     qread_sync = Queue(36)
